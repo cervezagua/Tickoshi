@@ -13,6 +13,9 @@
   <img src="https://img.shields.io/badge/Platform-Windows%20%7C%20Linux-lightgrey?style=flat-square" />
   <img src="https://img.shields.io/badge/No%20dependencies-zero%20pip%20installs%20to%20run-brightgreen?style=flat-square" />
 </p>
+<p align="center">
+<img width="560" height="138" alt="image" src="https://github.com/user-attachments/assets/f3c2736f-3126-4478-96aa-0f01d9e3d370" />
+</p>
 
 ---
 
