@@ -12,8 +12,17 @@ import urllib.error
 
 # ── Constants ────────────────────────────────────────────────────────────────
 APP_NAME   = "BtcWidget"
-REFRESH_S  = 30          # seconds between price fetches
 MAX_DIGITS = 9           # max digit panels (up to 999,999,999)
+
+# Refresh interval presets: label → seconds
+REFRESH_OPTIONS = [
+    ("30 sec",  30),
+    ("1 min",   60),
+    ("5 min",   300),
+    ("15 min",  900),
+    ("30 min",  1800),
+    ("1 hr",    3600),
+]
 
 DRUM_STEPS = 12
 DRUM_MS    = 14
@@ -376,6 +385,8 @@ class BtcWidget(tk.Tk):
         self._cfg   = self._load_config()
         self._scale = self._cfg.get("scale", 1.0)
         self._currency = self._cfg.get("currency", "USD")
+        self._topmost = self._cfg.get("topmost", True)
+        self._refresh_s = self._cfg.get("refresh_s", 30)
         self._drag  = None
         self._last_price_str = None
         self._num_digits = 5       # initial guess; rebuilt on first price
@@ -383,7 +394,7 @@ class BtcWidget(tk.Tk):
 
         # Frameless, always-on-top
         self.overrideredirect(True)
-        self.wm_attributes("-topmost", True)
+        self.wm_attributes("-topmost", self._topmost)
         self.wm_attributes("-alpha", 0.97)
         self.configure(bg=C_FACE)
 
@@ -410,10 +421,12 @@ class BtcWidget(tk.Tk):
             return {"x": 100, "y": 100, "scale": 1.0, "currency": "USD"}
 
     def _save_config(self):
-        self._cfg["x"]        = self.winfo_x()
-        self._cfg["y"]        = self.winfo_y()
-        self._cfg["scale"]    = self._scale
-        self._cfg["currency"] = self._currency
+        self._cfg["x"]         = self.winfo_x()
+        self._cfg["y"]         = self.winfo_y()
+        self._cfg["scale"]     = self._scale
+        self._cfg["currency"]  = self._currency
+        self._cfg["topmost"]   = self._topmost
+        self._cfg["refresh_s"] = self._refresh_s
         try:
             with open(config_path(), "w") as f:
                 json.dump(self._cfg, f, indent=2)
@@ -516,7 +529,7 @@ class BtcWidget(tk.Tk):
             if self.winfo_exists():
                 self.after(0, lambda: self._update_price(price))
             if self.winfo_exists():
-                self.after(REFRESH_S * 1000, self._fetch_loop)
+                self.after(self._refresh_s * 1000, self._fetch_loop)
 
         t = threading.Thread(target=_worker, daemon=True)
         t.start()
@@ -536,8 +549,6 @@ class BtcWidget(tk.Tk):
 
     # ── Drag to move ───────────────────────────────────────────────────────────
     def _ds(self, e):
-        if self._popup is not None:
-            return
         self._drag = (e.x_root - self.winfo_x(), e.y_root - self.winfo_y())
 
     def _dm(self, e):
@@ -559,6 +570,10 @@ class BtcWidget(tk.Tk):
             except Exception:
                 pass
             self._popup = None
+        try:
+            self.grab_release()
+        except Exception:
+            pass
 
         menu_style = dict(tearoff=0, bg="#1a1a1a", fg="#ffffff",
                           activebackground="#333333", activeforeground="#ffffff",
@@ -582,15 +597,37 @@ class BtcWidget(tk.Tk):
                                  command=lambda c=code: self._menu_set_currency(c))
         menu.add_cascade(label="  Currency", menu=curr_menu)
 
+        # Refresh interval submenu
+        ref_menu = tk.Menu(menu, **menu_style)
+        for label, secs in REFRESH_OPTIONS:
+            check = " \u2713" if self._refresh_s == secs else ""
+            ref_menu.add_command(label=f"  {label}{check}",
+                                command=lambda s=secs: self._menu_set_refresh(s))
+        menu.add_cascade(label="  Refresh", menu=ref_menu)
+
+        # Always on top toggle
+        top_check = " \u2713" if self._topmost else ""
+        menu.add_command(label=f"  Always on top{top_check}",
+                         command=self._menu_toggle_topmost)
+
         menu.add_separator()
         menu.add_command(label="  Close", command=self._menu_quit)
 
         menu.tk_popup(e.x_root, e.y_root)
+        # Clean up when menu is dismissed (item click, Escape, or click-away)
+        menu.bind("<Unmap>", self._on_popup_close)
         return "break"
+
+    def _on_popup_close(self, _event=None):
+        """Release any stale grab left by tk_popup and clean up the menu."""
+        self._popup = None
+        try:
+            self.grab_release()
+        except Exception:
+            pass
 
     def _menu_set_size(self, scale):
         # Let native popup close itself, then rebuild after a short delay
-        self._popup = None
         self.after(30, lambda: self._do_set_size(scale))
 
     def _do_set_size(self, scale):
@@ -602,7 +639,6 @@ class BtcWidget(tk.Tk):
         self._save_config()
 
     def _menu_set_currency(self, code):
-        self._popup = None
         if code == self._currency:
             return
         self.after(30, lambda: self._do_set_currency(code))
@@ -619,8 +655,16 @@ class BtcWidget(tk.Tk):
             dp.set("-")
         self._fetch_loop()
 
+    def _menu_set_refresh(self, secs):
+        self._refresh_s = secs
+        self._save_config()
+
+    def _menu_toggle_topmost(self):
+        self._topmost = not self._topmost
+        self.wm_attributes("-topmost", self._topmost)
+        self._save_config()
+
     def _menu_quit(self):
-        self._popup = None
         self.after(30, lambda: (self._save_config(), self.destroy()))
 
 # ── Entry point ───────────────────────────────────────────────────────────────
