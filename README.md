@@ -5,7 +5,11 @@
 <h1 align="center">Tickoshi</h1>
 
 <p align="center">
-  A live Bitcoin price widget for your desktop — inspired by the Coinkite BlockClock Mini.
+  A live Bitcoin price ticker for your desktop — inspired by the Coinkite BlockClock Mini.
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/version-1.1-orange?style=flat-square" />
 </p>
 
 <p align="center">
@@ -14,21 +18,26 @@
   <img src="https://img.shields.io/badge/No%20dependencies-zero%20pip%20installs%20to%20run-brightgreen?style=flat-square" />
 </p>
 <p align="center">
-<img width="560" height="138" alt="image" src="https://github.com/user-attachments/assets/f3c2736f-3126-4478-96aa-0f01d9e3d370" />
+<img width="560" height="180" alt="image" src="https://github.com/user-attachments/assets/81693947-de56-4600-ae6b-e4d06247cba9" />
 </p>
-
 ---
 
 ## Features
 
 - **Live price** — customizable refresh interval (30 sec – 1 hr) via CoinGecko (Binance fallback)
+- **Currency sign panel** — displays $, ₺, €, £, ¥, ₽ next to the price
 - **Flip animation** — smooth drum-roll transition on every digit change
-- **Accordion layout** — panels adjust automatically to match the digit count of the current price
+- **Accordion layout** — panels adjust automatically to match the digit count
+- **Price flash** — spark chase animation races around the border on price changes (green = up, red = down)
+- **3 view modes** — live BTC price, current block height, or halving countdown
 - **6 currencies** — USD · TRY · EUR · GBP · JPY · RUB
 - **3 size presets** — Small · Medium · Large
+- **3 border colors** — Gold · Orange · White
+- **Opacity control** — 50% · 70% · 85% · 100%
 - **Always-on-top toggle** — keep it above all windows, or let it blend in
 - **Frameless & draggable** — click and drag anywhere to reposition
-- **Persistent config** — position, size, currency, refresh rate, and always-on-top are remembered
+- **Double-click to copy** — copies current value to clipboard
+- **Persistent config** — all settings are remembered between sessions
 
 ---
 
@@ -67,7 +76,7 @@ chmod +x BUILD.sh
 ./BUILD.sh
 ```
 
-Produces `dist/Tickoshi` — a single ELF binary. A `.desktop` launcher is also created automatically at `~/.local/share/applications/Tickoshi.desktop`.
+Produces `dist/Tickoshi` — a single ELF binary. A `.desktop` launcher is also created automatically at `~/.local/share/applications/tickoshi.desktop`.
 
 > Both scripts install PyInstaller automatically if it is not already present.
 
@@ -78,11 +87,24 @@ Produces `dist/Tickoshi` — a single ELF binary. A `.desktop` launcher is also 
 | Action | How |
 |---|---|
 | Move widget | Click and drag anywhere |
+| Copy value to clipboard | Double-click |
+| Change view mode | Right-click → **View** |
 | Change size | Right-click → **Size** |
 | Change currency | Right-click → **Currency** |
 | Change refresh rate | Right-click → **Refresh** |
+| Change opacity | Right-click → **Opacity** |
+| Change border color | Right-click → **Border** |
 | Toggle always-on-top | Right-click → **Always on top** |
+| Toggle price flash | Right-click → **Price flash** |
 | Close | Right-click → **Close** |
+
+### View modes
+
+| Mode | Sign | Displays |
+|---|---|---|
+| Price | $ ₺ € £ ¥ ₽ | Live BTC price in selected currency |
+| Block Height | # | Current Bitcoin block height |
+| Halving | ⏳ | Estimated days until next halving |
 
 ### Supported currencies
 
@@ -103,12 +125,12 @@ Produces `dist/Tickoshi` — a single ELF binary. A `.desktop` launcher is also 
 
 ## Config
 
-Settings are saved automatically when you move, resize, or close the widget.
+Settings are saved automatically when you move, resize, or change any option.
 
 | Platform | Location |
 |---|---|
-| Windows | `%APPDATA%\BtcWidget\btc_config.json` |
-| Linux / macOS | `~/.config/BtcWidget/btc_config.json` |
+| Windows | `%APPDATA%\Tickoshi\tickoshi_config.json` |
+| Linux / macOS | `~/.config/Tickoshi/tickoshi_config.json` |
 
 ---
 
@@ -118,4 +140,5 @@ Settings are saved automatically when you move, resize, or close the widget.
 |---|---|
 | UI | Python / Tkinter (stdlib only) |
 | Price API | [CoinGecko](https://www.coingecko.com/) (primary) · Binance (fallback) |
+| Block API | [blockchain.info](https://blockchain.info/) |
 | Build | [PyInstaller](https://pyinstaller.org/) |
