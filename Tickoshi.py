@@ -1,17 +1,19 @@
 """
-BTC Widget — BlockClock Mini style desktop widget
-Live Bitcoin price, frameless, always-on-top, draggable.
+Tickoshi — BlockClock Mini style desktop widget
+Live Bitcoin price, block height, halving countdown.
+Frameless, always-on-top, draggable.
 """
 
 import tkinter as tk
 import threading
 import json
 import os
+import math
 import urllib.request
 import urllib.error
 
 # ── Constants ────────────────────────────────────────────────────────────────
-APP_NAME   = "BtcWidget"
+APP_NAME   = "Tickoshi"
 MAX_DIGITS = 9           # max digit panels (up to 999,999,999)
 
 # Refresh interval presets: label → seconds
@@ -40,15 +42,43 @@ CURRENCIES = [
     ("RUB", "BTCRUB",  "rub"),
 ]
 
+# Currency symbols
+CURRENCY_SIGNS = {
+    "USD": "$", "TRY": "\u20ba", "EUR": "\u20ac",
+    "GBP": "\u00a3", "JPY": "\u00a5", "RUB": "\u20bd",
+}
+
+# View modes
+VIEW_MODES = ["Price", "Block Height", "Halving"]
+
+# Opacity presets
+OPACITY_OPTIONS = [("50%", 0.5), ("70%", 0.7), ("85%", 0.85), ("100%", 1.0)]
+
+# Border color themes
+BORDER_COLORS = {
+    "Gold":   {"hi": "#c9a84c", "lo": "#6a5820", "line": "#c9a84c"},
+    "Orange": {"hi": "#e88a2d", "lo": "#7a4a18", "line": "#e88a2d"},
+    "White":  {"hi": "#cccccc", "lo": "#666666", "line": "#cccccc"},
+}
+
+# Next Bitcoin halving block
+NEXT_HALVING_BLOCK = 1_050_000
+
+# Spark chase animation
+SPARK_SEGMENTS = 48      # number of border segments
+SPARK_TRAIL    = 8       # trail length in segments
+SPARK_MS       = 16      # ms per step (~768ms full loop)
+
 # Panel base dimensions (at scale 1.0)
 BASE_PANEL_W = 80
 BASE_PANEL_H = 110
-BASE_FS      = 62        # digit font size
-BASE_R       = 10        # card corner radius
+BASE_SIGN_W  = 50         # currency sign panel (narrower)
+BASE_FS      = 62          # digit font size
+BASE_R       = 10          # card corner radius
 
 # Layout
-FACE_PAD     = 6         # padding inside gold border
-PANEL_GAP    = 8         # gap between panels
+FACE_PAD     = 6           # padding inside gold border
+PANEL_GAP    = 8           # gap between panels
 
 # Label panel
 BASE_LABEL_W  = 78
@@ -57,11 +87,8 @@ BASE_LABEL_FS = 16
 # ── Colors ───────────────────────────────────────────────────────────────────
 C_FACE       = "#080808"   # face background
 C_PANEL_BG   = "#0c0c0c"   # panel card background
-C_BORDER_LO  = "#6a5820"   # panel border dim
-C_BORDER_HI  = "#c9a84c"   # panel border gold highlight / outer frame
 C_DIGIT      = "#ffffff"   # active digit
 C_LABEL_TXT  = "#ffffff"   # "BTC/USD" label text
-C_LABEL_LINE = "#c9a84c"   # divider line in label panel
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def _darken(hex_c: str, f: float) -> str:
@@ -86,7 +113,7 @@ def config_path() -> str:
                               os.path.join(os.path.expanduser("~"), ".config"))
     d = os.path.join(base, APP_NAME)
     os.makedirs(d, exist_ok=True)
-    return os.path.join(d, "btc_config.json")
+    return os.path.join(d, "tickoshi_config.json")
 
 def _rr_pts(x1, y1, x2, y2, r):
     r = min(r, (x2-x1)//2, (y2-y1)//2)
@@ -95,6 +122,64 @@ def _rr_pts(x1, y1, x2, y2, r):
         x2,y2-r, x2,y2,   x2-r,y2, x1+r,y2,
         x1,y2,   x1,y2-r, x1,y1+r, x1,y1,
     ]
+
+def _perimeter_points(x1, y1, x2, y2, r, n):
+    """Generate n evenly-spaced points clockwise around a rounded rectangle."""
+    r = min(r, (x2-x1)//2, (y2-y1)//2)
+    # Build path: straight edges + quarter-circle corners
+    # Corners: top-right, bottom-right, bottom-left, top-left
+    path = []
+    # Top edge (left to right)
+    path.append(("line", x1+r, y1, x2-r, y1))
+    # Top-right corner
+    path.append(("arc", x2-r, y1+r, r, -math.pi/2, 0))
+    # Right edge (top to bottom)
+    path.append(("line", x2, y1+r, x2, y2-r))
+    # Bottom-right corner
+    path.append(("arc", x2-r, y2-r, r, 0, math.pi/2))
+    # Bottom edge (right to left)
+    path.append(("line", x2-r, y2, x1+r, y2))
+    # Bottom-left corner
+    path.append(("arc", x1+r, y2-r, r, math.pi/2, math.pi))
+    # Left edge (bottom to top)
+    path.append(("line", x1, y2-r, x1, y1+r))
+    # Top-left corner
+    path.append(("arc", x1+r, y1+r, r, math.pi, 3*math.pi/2))
+
+    # Calculate total perimeter length
+    lengths = []
+    for seg in path:
+        if seg[0] == "line":
+            _, lx1, ly1, lx2, ly2 = seg
+            lengths.append(math.hypot(lx2-lx1, ly2-ly1))
+        else:
+            _, _, _, rad, _, _ = seg
+            lengths.append(rad * math.pi / 2)  # quarter circle
+    total = sum(lengths)
+
+    # Sample n points
+    points = []
+    for i in range(n):
+        target = (i / n) * total
+        accum = 0.0
+        for j, seg in enumerate(path):
+            seg_len = lengths[j]
+            if accum + seg_len >= target or j == len(path) - 1:
+                t = (target - accum) / seg_len if seg_len > 0 else 0
+                t = max(0.0, min(1.0, t))
+                if seg[0] == "line":
+                    _, lx1, ly1, lx2, ly2 = seg
+                    px = lx1 + (lx2 - lx1) * t
+                    py = ly1 + (ly2 - ly1) * t
+                else:
+                    _, cx, cy, rad, a_start, a_end = seg
+                    angle = a_start + (a_end - a_start) * t
+                    px = cx + rad * math.cos(angle)
+                    py = cy + rad * math.sin(angle)
+                points.append((px, py))
+                break
+            accum += seg_len
+    return points
 
 # ── FlipCard ──────────────────────────────────────────────────────────────────
 class FlipCard(tk.Frame):
@@ -213,18 +298,15 @@ class FlipCard(tk.Frame):
                 self._draw_static(self._cur)
 
 # ── Price API ─────────────────────────────────────────────────────────────────
-# Cache: fetch ALL currencies in one CoinGecko call to avoid rate limits
-_price_cache = {}       # {"usd": 69500, "try": 2300000, ...}
+_price_cache = {}
+_block_height_cache = {"height": None}
 _price_cache_lock = threading.Lock()
 
 def _fetch_all_prices():
-    """Fetch BTC price in all currencies with a single API call. Updates cache."""
     gecko_ids = ",".join(gid for _, _, gid in CURRENCIES)
-
-    # Try CoinGecko first (single call for all currencies)
     try:
         url = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=" + gecko_ids
-        req = urllib.request.Request(url, headers={"User-Agent": "BtcWidget/1.0"})
+        req = urllib.request.Request(url, headers={"User-Agent": "Tickoshi/1.0"})
         with urllib.request.urlopen(req, timeout=8) as r:
             data = json.loads(r.read().decode())
         with _price_cache_lock:
@@ -234,12 +316,10 @@ def _fetch_all_prices():
         return True
     except Exception:
         pass
-
-    # Fallback: try Binance per-pair
     for code, bsym, gid in CURRENCIES:
         try:
             url = "https://api.binance.com/api/v3/ticker/price?symbol=" + bsym
-            req = urllib.request.Request(url, headers={"User-Agent": "BtcWidget/1.0"})
+            req = urllib.request.Request(url, headers={"User-Agent": "Tickoshi/1.0"})
             with urllib.request.urlopen(req, timeout=5) as r:
                 data = json.loads(r.read().decode())
             with _price_cache_lock:
@@ -248,8 +328,19 @@ def _fetch_all_prices():
             continue
     return bool(_price_cache)
 
+def _fetch_block_height():
+    try:
+        url = "https://blockchain.info/q/getblockcount"
+        req = urllib.request.Request(url, headers={"User-Agent": "Tickoshi/1.0"})
+        with urllib.request.urlopen(req, timeout=8) as r:
+            height = int(r.read().decode().strip())
+        with _price_cache_lock:
+            _block_height_cache["height"] = height
+        return height
+    except Exception:
+        return _block_height_cache.get("height")
+
 def fetch_price(currency: str = "USD") -> str | None:
-    """Returns price as integer string from cache, or None."""
     gecko_id = "usd"
     for code, _, gid in CURRENCIES:
         if code == currency:
@@ -261,12 +352,27 @@ def fetch_price(currency: str = "USD") -> str | None:
         return str(int(round(price)))
     return None
 
+def fetch_block_height_str() -> str | None:
+    with _price_cache_lock:
+        h = _block_height_cache.get("height")
+    if h is not None:
+        return str(h)
+    return None
+
+def calc_halving_days(height: int) -> int | None:
+    if height is None or height >= NEXT_HALVING_BLOCK:
+        return None
+    blocks_remaining = NEXT_HALVING_BLOCK - height
+    minutes_remaining = blocks_remaining * 10
+    return int(minutes_remaining / 60 / 24)
+
 # ── Digit Panel (FlipCard + gold border) ─────────────────────────────────────
 class DigitPanel(tk.Canvas):
-    """A canvas that draws the gold border frame and contains a FlipCard."""
 
-    def __init__(self, parent, scale=1.0, **kw):
+    def __init__(self, parent, scale=1.0, border_hi="#c9a84c", border_lo="#6a5820", **kw):
         self._scale = scale
+        self._border_hi = border_hi
+        self._border_lo = border_lo
         pw = max(30, int(BASE_PANEL_W * scale))
         ph = max(40, int(BASE_PANEL_H * scale))
         pad = max(3, int(4 * scale))
@@ -285,9 +391,9 @@ class DigitPanel(tk.Canvas):
         pw, ph = self._pw, self._ph
         r = max(4, int(BASE_R * self._scale))
         self._draw_rr(1, 1, pw+pad*2-2, ph+pad*2-2, r+2,
-                      outline=C_BORDER_LO, width=1)
+                      outline=self._border_lo, width=1)
         self._draw_rr(pad-2, pad-2, pw+pad+2, ph+pad+2, r+1,
-                      outline=C_BORDER_HI, width=1)
+                      outline=self._border_hi, width=1)
 
     def _draw_rr(self, x1, y1, x2, y2, r, **kw):
         r = min(r, (x2-x1)//2, (y2-y1)//2)
@@ -301,8 +407,10 @@ class DigitPanel(tk.Canvas):
     def set(self, digit: str):
         self.card.set(digit)
 
-    def rebuild(self, scale):
+    def rebuild(self, scale, border_hi=None, border_lo=None):
         self._scale = scale
+        if border_hi: self._border_hi = border_hi
+        if border_lo: self._border_lo = border_lo
         pw = max(30, int(BASE_PANEL_W * scale))
         ph = max(40, int(BASE_PANEL_H * scale))
         pad = max(3, int(4 * scale))
@@ -313,13 +421,79 @@ class DigitPanel(tk.Canvas):
         self.create_window(pad, pad, anchor="nw", window=self.card)
         self._draw_border()
 
+# ── Sign Panel (currency symbol + gold border) ──────────────────────────────
+class SignPanel(tk.Canvas):
+
+    def __init__(self, parent, scale=1.0, symbol="$",
+                 border_hi="#c9a84c", border_lo="#6a5820", **kw):
+        self._scale = scale
+        self._symbol = symbol
+        self._border_hi = border_hi
+        self._border_lo = border_lo
+        pw = max(20, int(BASE_SIGN_W * scale))
+        ph = max(40, int(BASE_PANEL_H * scale))
+        pad = max(3, int(4 * scale))
+        super().__init__(parent, width=pw + pad*2, height=ph + pad*2,
+                         bg=C_FACE, highlightthickness=0, **kw)
+        self._pad, self._pw, self._ph = pad, pw, ph
+        self._draw()
+
+    def _draw(self):
+        self.delete("all")
+        pad = self._pad
+        pw, ph = self._pw, self._ph
+        r  = max(4, int(BASE_R * self._scale))
+        fs = max(12, int(BASE_FS * self._scale * 0.7))
+
+        # Card background
+        self._draw_rr(pad, pad, pad+pw, pad+ph, r, fill=C_PANEL_BG, outline="")
+
+        # Border
+        self._draw_rr(1, 1, pw+pad*2-2, ph+pad*2-2, r+2,
+                      outline=self._border_lo, width=1)
+        self._draw_rr(pad-2, pad-2, pw+pad+2, ph+pad+2, r+1,
+                      outline=self._border_hi, width=1)
+
+        # Symbol text
+        cx = pad + pw // 2
+        cy = pad + ph // 2
+        font = ("Segoe UI", fs, "bold")
+        self.create_text(cx, cy, text=self._symbol, font=font,
+                         fill=C_DIGIT, anchor="center")
+
+    def _draw_rr(self, x1, y1, x2, y2, r, **kw):
+        r = min(r, (x2-x1)//2, (y2-y1)//2)
+        pts = [
+            x1+r,y1, x2-r,y1, x2,y1,   x2,y1+r,
+            x2,y2-r, x2,y2,   x2-r,y2, x1+r,y2,
+            x1,y2,   x1,y2-r, x1,y1+r, x1,y1,
+        ]
+        self.create_polygon(pts, smooth=True, **kw)
+
+    def rebuild(self, scale, symbol=None, border_hi=None, border_lo=None):
+        self._scale = scale
+        if symbol is not None:
+            self._symbol = symbol
+        if border_hi: self._border_hi = border_hi
+        if border_lo: self._border_lo = border_lo
+        pw = max(20, int(BASE_SIGN_W * scale))
+        ph = max(40, int(BASE_PANEL_H * scale))
+        pad = max(3, int(4 * scale))
+        self._pad, self._pw, self._ph = pad, pw, ph
+        self.config(width=pw+pad*2, height=ph+pad*2)
+        self._draw()
+
 # ── Label Panel ───────────────────────────────────────────────────────────────
 class LabelPanel(tk.Canvas):
-    """Static panel showing BTC / <currency>."""
 
-    def __init__(self, parent, scale=1.0, currency="USD", **kw):
+    def __init__(self, parent, scale=1.0, currency="USD", view_mode="Price",
+                 border_hi="#c9a84c", border_lo="#6a5820", line_color="#c9a84c", **kw):
         self._scale = scale
         self._currency = currency
+        self._view_mode = view_mode
+        self._border_hi = border_hi
+        self._border_lo = border_lo
+        self._line_color = line_color
         pw = max(30, int(BASE_LABEL_W * scale))
         ph = max(40, int(BASE_PANEL_H * scale))
         pad = max(3, int(4 * scale))
@@ -341,20 +515,27 @@ class LabelPanel(tk.Canvas):
         self._rr(pad, pad, pad+pw, pad+ph, r, fill=C_PANEL_BG, outline="")
 
         # Border
-        self._rr(1, 1, pw+pad*2-2, ph+pad*2-2, r+2, outline=C_BORDER_LO, width=1)
-        self._rr(pad-2, pad-2, pw+pad+2, ph+pad+2, r+1, outline=C_BORDER_HI, width=1)
+        self._rr(1, 1, pw+pad*2-2, ph+pad*2-2, r+2, outline=self._border_lo, width=1)
+        self._rr(pad-2, pad-2, pw+pad+2, ph+pad+2, r+1, outline=self._border_hi, width=1)
 
-        # "BTC" top
         font_bold = ("Segoe UI", fs, "bold")
-        self.create_text(cx, cy - int(ph * 0.15), text="BTC",
+
+        if self._view_mode == "Price":
+            top_text, bot_text = "BTC", self._currency
+        elif self._view_mode == "Block Height":
+            top_text, bot_text = "BLOCK", "HEIGHT"
+        elif self._view_mode == "Halving":
+            top_text, bot_text = "HALV", "DAYS"
+        else:
+            top_text, bot_text = "BTC", self._currency
+
+        self.create_text(cx, cy - int(ph * 0.15), text=top_text,
                          font=font_bold, fill=C_LABEL_TXT, anchor="center")
-        # Divider line
         lw = int(pw * 0.6)
         self.create_line(cx - lw//2, cy + int(ph * 0.03),
                          cx + lw//2, cy + int(ph * 0.03),
-                         fill=C_LABEL_LINE, width=max(1, int(1.5 * self._scale)))
-        # Currency bottom
-        self.create_text(cx, cy + int(ph * 0.22), text=self._currency,
+                         fill=self._line_color, width=max(1, int(1.5 * self._scale)))
+        self.create_text(cx, cy + int(ph * 0.22), text=bot_text,
                          font=font_bold, fill=C_LABEL_TXT, anchor="center")
 
     def _rr(self, x1, y1, x2, y2, r, **kw):
@@ -366,10 +547,14 @@ class LabelPanel(tk.Canvas):
         ]
         self.create_polygon(pts, smooth=True, **kw)
 
-    def rebuild(self, scale, currency=None):
+    def rebuild(self, scale, currency=None, view_mode=None,
+                border_hi=None, border_lo=None, line_color=None):
         self._scale = scale
-        if currency is not None:
-            self._currency = currency
+        if currency is not None: self._currency = currency
+        if view_mode is not None: self._view_mode = view_mode
+        if border_hi: self._border_hi = border_hi
+        if border_lo: self._border_lo = border_lo
+        if line_color: self._line_color = line_color
         pw = max(30, int(BASE_LABEL_W * scale))
         ph = max(40, int(BASE_PANEL_H * scale))
         pad = max(3, int(4 * scale))
@@ -378,7 +563,7 @@ class LabelPanel(tk.Canvas):
         self._draw()
 
 # ── Main Widget Window ─────────────────────────────────────────────────────────
-class BtcWidget(tk.Tk):
+class Tickoshi(tk.Tk):
 
     def __init__(self):
         super().__init__()
@@ -387,30 +572,42 @@ class BtcWidget(tk.Tk):
         self._currency = self._cfg.get("currency", "USD")
         self._topmost = self._cfg.get("topmost", True)
         self._refresh_s = self._cfg.get("refresh_s", 30)
+        self._opacity = self._cfg.get("opacity", 0.97)
+        self._view_mode = self._cfg.get("view_mode", "Price")
+        self._border_color = self._cfg.get("border_color", "Gold")
+        self._flash_enabled = self._cfg.get("flash", True)
         self._drag  = None
         self._last_price_str = None
-        self._num_digits = 5       # initial guess; rebuilt on first price
-        self._popup = None         # current popup menu reference
+        self._last_display_str = None
+        self._prev_price = None        # for flash comparison
+        self._num_digits = 5
+        self._popup = None
+        self._spark_pts = []           # perimeter points for spark overlay
+        self._spark_overlay_ids = []   # temporary overlay line ids
+        self._spark_running = False
 
         # Frameless, always-on-top
         self.overrideredirect(True)
         self.wm_attributes("-topmost", self._topmost)
-        self.wm_attributes("-alpha", 0.97)
+        self.wm_attributes("-alpha", self._opacity)
         self.configure(bg=C_FACE)
 
         self._build_ui(self._num_digits)
         self._apply_position()
 
-        # Bind drag on root ONCE; children get drag bindings after each rebuild
+        # Bindings
         self.bind("<ButtonPress-1>",   self._ds)
         self.bind("<B1-Motion>",       self._dm)
         self.bind("<ButtonRelease-1>", self._de)
-        # Right-click: bind_all so it fires exactly once regardless of widget
+        self.bind("<Double-Button-1>", self._copy_to_clipboard)
         self.bind_all("<ButtonPress-3>", self._show_menu)
         self._bind_children()
 
-        # Start background price fetcher
         self._fetch_loop()
+
+    # ── Border color helpers ──────────────────────────────────────────────────
+    def _bc(self, key="hi"):
+        return BORDER_COLORS.get(self._border_color, BORDER_COLORS["Gold"])[key]
 
     # ── Config ────────────────────────────────────────────────────────────────
     def _load_config(self) -> dict:
@@ -421,12 +618,16 @@ class BtcWidget(tk.Tk):
             return {"x": 100, "y": 100, "scale": 1.0, "currency": "USD"}
 
     def _save_config(self):
-        self._cfg["x"]         = self.winfo_x()
-        self._cfg["y"]         = self.winfo_y()
-        self._cfg["scale"]     = self._scale
-        self._cfg["currency"]  = self._currency
-        self._cfg["topmost"]   = self._topmost
-        self._cfg["refresh_s"] = self._refresh_s
+        self._cfg["x"]            = self.winfo_x()
+        self._cfg["y"]            = self.winfo_y()
+        self._cfg["scale"]        = self._scale
+        self._cfg["currency"]     = self._currency
+        self._cfg["topmost"]      = self._topmost
+        self._cfg["refresh_s"]    = self._refresh_s
+        self._cfg["opacity"]      = self._opacity
+        self._cfg["view_mode"]    = self._view_mode
+        self._cfg["border_color"] = self._border_color
+        self._cfg["flash"]        = self._flash_enabled
         try:
             with open(config_path(), "w") as f:
                 json.dump(self._cfg, f, indent=2)
@@ -441,80 +642,163 @@ class BtcWidget(tk.Tk):
     # ── UI Build ───────────────────────────────────────────────────────────────
     def _build_ui(self, num_digits):
         self._num_digits = num_digits
+        self._spark_overlay_ids = []
+        self._spark_running = False
         s = self._scale
         fp   = max(4, int(FACE_PAD * s))
         gap  = max(4, int(PANEL_GAP * s))
 
-        # Destroy old widgets (but not popup menus)
         for w in self.winfo_children():
             w.destroy()
 
-        # Calculate sizes
         pad = max(3, int(4 * s))
         label_w = max(30, int(BASE_LABEL_W * s)) + pad * 2
+        sign_w  = max(20, int(BASE_SIGN_W * s)) + pad * 2
         digit_w = max(30, int(BASE_PANEL_W * s)) + pad * 2
         panel_h = max(40, int(BASE_PANEL_H * s)) + pad * 2
 
-        inner_w = label_w + gap + num_digits * digit_w + (num_digits - 1) * gap
+        inner_w = label_w + gap + sign_w + gap + num_digits * digit_w + (num_digits - 1) * gap
         total_w = inner_w + fp * 2
         total_h = panel_h + fp * 2
 
-        # Outer frame canvas (gold border on black face)
         self._frame_cv = tk.Canvas(self, width=total_w, height=total_h,
                                    bg=C_FACE, highlightthickness=0)
         self._frame_cv.pack()
 
-        # Gold border line
+        # Smooth outer border polygon
         r = max(4, int(6 * s))
         border_w = max(2, int(2.5 * s))
+        self._frame_border_w = border_w
         pts = _rr_pts(1, 1, total_w - 2, total_h - 2, r)
-        self._frame_cv.create_polygon(pts, smooth=True, fill="", outline=C_BORDER_HI,
-                                      width=border_w)
+        self._frame_cv.create_polygon(pts, smooth=True, fill="",
+                                      outline=self._bc("hi"), width=border_w)
+
+        # Pre-compute perimeter points for spark chase overlay
+        self._spark_pts = _perimeter_points(1, 1, total_w - 2, total_h - 2, r,
+                                            SPARK_SEGMENTS)
+        self._spark_overlay_ids = []
 
         # Panel row
         row = tk.Frame(self._frame_cv, bg=C_FACE)
-        self._frame_cv.create_window(
-            total_w // 2, total_h // 2,
-            anchor="center", window=row
-        )
+        self._frame_cv.create_window(total_w // 2, total_h // 2,
+                                     anchor="center", window=row)
 
         # Label panel
-        self._label_panel = LabelPanel(row, scale=s, currency=self._currency)
+        self._label_panel = LabelPanel(
+            row, scale=s, currency=self._currency, view_mode=self._view_mode,
+            border_hi=self._bc("hi"), border_lo=self._bc("lo"),
+            line_color=self._bc("line"))
         self._label_panel.pack(side="left", padx=(0, gap))
+
+        # Sign panel
+        sign = self._get_sign_symbol()
+        self._sign_panel = SignPanel(
+            row, scale=s, symbol=sign,
+            border_hi=self._bc("hi"), border_lo=self._bc("lo"))
+        self._sign_panel.pack(side="left", padx=(0, gap))
 
         # Digit panels
         self._digit_panels = []
         for i in range(num_digits):
-            dp = DigitPanel(row, scale=s)
+            dp = DigitPanel(row, scale=s,
+                            border_hi=self._bc("hi"), border_lo=self._bc("lo"))
             dp.pack(side="left", padx=(0, gap if i < num_digits - 1 else 0))
             self._digit_panels.append(dp)
 
-        # Re-apply last known price to new panels
-        if self._last_price_str is not None:
-            self._set_digits(self._last_price_str)
+        if self._last_display_str is not None:
+            self._set_digits(self._last_display_str)
 
-    # ── Price display ──────────────────────────────────────────────────────────
-    def _update_price(self, price_str: str | None):
-        """Map price string to digit panels. Rebuild if digit count changed."""
-        if price_str is None:
+    def _get_sign_symbol(self) -> str:
+        if self._view_mode == "Price":
+            return CURRENCY_SIGNS.get(self._currency, "$")
+        elif self._view_mode == "Block Height":
+            return "#"
+        elif self._view_mode == "Halving":
+            return "\u23f3"
+        return "$"
+
+    # ── Spark chase animation ─────────────────────────────────────────────────
+    def _spark_chase(self, color):
+        """Run spark chase overlay around the border in the given color."""
+        if not self._spark_pts or self._spark_running:
+            return
+        # Clean up any leftover overlay segments
+        self._spark_cleanup()
+        self._spark_running = True
+        self._spark_step(color, 0)
+
+    def _spark_cleanup(self):
+        for sid in self._spark_overlay_ids:
+            try:
+                self._frame_cv.delete(sid)
+            except Exception:
+                pass
+        self._spark_overlay_ids = []
+
+    def _spark_step(self, color, step):
+        if not self.winfo_exists() or not self._spark_pts:
+            self._spark_cleanup()
+            self._spark_running = False
+            return
+        n = SPARK_SEGMENTS
+
+        if step >= n + SPARK_TRAIL:
+            self._spark_cleanup()
+            self._spark_running = False
+            return
+
+        # Remove previous overlay segments
+        self._spark_cleanup()
+
+        # Draw only the lit segments (trail) as overlay lines
+        bw = self._frame_border_w
+        for i in range(n):
+            dist = step - i
+            if 0 <= dist < SPARK_TRAIL:
+                t = dist / SPARK_TRAIL
+                c = _lerp(color, self._bc("hi"), t)
+                x1, y1 = self._spark_pts[i]
+                x2, y2 = self._spark_pts[(i + 1) % n]
+                sid = self._frame_cv.create_line(
+                    x1, y1, x2, y2, fill=c, width=bw + 1,
+                    capstyle="round")
+                self._spark_overlay_ids.append(sid)
+
+        self.after(SPARK_MS, lambda: self._spark_step(color, step + 1))
+
+    # ── Display update ────────────────────────────────────────────────────────
+    def _update_display(self, display_str: str | None):
+        if display_str is None:
             for dp in self._digit_panels:
                 dp.set("-")
             return
 
-        self._last_price_str = price_str
-        needed = min(max(len(price_str), 1), MAX_DIGITS)
+        # Flash check (Price mode only)
+        if self._flash_enabled and self._view_mode == "Price" and display_str is not None:
+            try:
+                new_val = int(display_str)
+                if self._prev_price is not None:
+                    if new_val > self._prev_price:
+                        self._spark_chase("#00cc44")   # green = up
+                    elif new_val < self._prev_price:
+                        self._spark_chase("#cc2222")   # red = down
+                self._prev_price = new_val
+            except ValueError:
+                pass
 
-        # Accordion: rebuild panels if digit count changed
+        self._last_display_str = display_str
+        needed = min(max(len(display_str), 1), MAX_DIGITS)
+
         if needed != self._num_digits:
             pos_x, pos_y = self.winfo_x(), self.winfo_y()
             self._build_ui(needed)
             self._bind_children()
             self.geometry(f"+{pos_x}+{pos_y}")
         else:
-            self._set_digits(price_str)
+            self._set_digits(display_str)
 
-    def _set_digits(self, price_str: str):
-        digits = list(price_str[-self._num_digits:])
+    def _set_digits(self, display_str: str):
+        digits = list(display_str[-self._num_digits:])
         while len(digits) < self._num_digits:
             digits.insert(0, "")
         for i, dp in enumerate(self._digit_panels):
@@ -523,20 +807,35 @@ class BtcWidget(tk.Tk):
     # ── Fetch loop ─────────────────────────────────────────────────────────────
     def _fetch_loop(self):
         currency = self._currency
+        view_mode = self._view_mode
         def _worker():
-            _fetch_all_prices()   # batch-fetch all currencies in one call
-            price = fetch_price(currency)
+            _fetch_all_prices()
+            _fetch_block_height()
+
+            if view_mode == "Price":
+                display = fetch_price(currency)
+                self._last_price_str = display
+            elif view_mode == "Block Height":
+                display = fetch_block_height_str()
+            elif view_mode == "Halving":
+                with _price_cache_lock:
+                    h = _block_height_cache.get("height")
+                days = calc_halving_days(h)
+                display = str(days) if days is not None else None
+            else:
+                display = fetch_price(currency)
+                self._last_price_str = display
+
             if self.winfo_exists():
-                self.after(0, lambda: self._update_price(price))
+                self.after(0, lambda: self._update_display(display))
             if self.winfo_exists():
                 self.after(self._refresh_s * 1000, self._fetch_loop)
 
         t = threading.Thread(target=_worker, daemon=True)
         t.start()
 
-    # ── Bind children (called after each rebuild) ──────────────────────────────
+    # ── Bindings ──────────────────────────────────────────────────────────────
     def _bind_children(self):
-        """Bind drag + right-click on all child widgets (fresh after rebuild)."""
         for c in self.winfo_children():
             self._bind_recursive(c)
 
@@ -544,10 +843,11 @@ class BtcWidget(tk.Tk):
         w.bind("<ButtonPress-1>",   self._ds)
         w.bind("<B1-Motion>",       self._dm)
         w.bind("<ButtonRelease-1>", self._de)
+        w.bind("<Double-Button-1>", self._copy_to_clipboard)
         for c in w.winfo_children():
             self._bind_recursive(c)
 
-    # ── Drag to move ───────────────────────────────────────────────────────────
+    # ── Drag ──────────────────────────────────────────────────────────────────
     def _ds(self, e):
         self._drag = (e.x_root - self.winfo_x(), e.y_root - self.winfo_y())
 
@@ -560,9 +860,14 @@ class BtcWidget(tk.Tk):
             self._save_config()
         self._drag = None
 
+    # ── Copy to clipboard ────────────────────────────────────────────────────
+    def _copy_to_clipboard(self, e):
+        if self._last_display_str:
+            self.clipboard_clear()
+            self.clipboard_append(self._last_display_str)
+
     # ── Right-click menu ──────────────────────────────────────────────────────
     def _show_menu(self, e):
-        # Dismiss any existing popup first
         if self._popup is not None:
             try:
                 self._popup.unpost()
@@ -581,6 +886,14 @@ class BtcWidget(tk.Tk):
         menu = tk.Menu(self, **menu_style)
         self._popup = menu
 
+        # View submenu
+        view_menu = tk.Menu(menu, **menu_style)
+        for mode in VIEW_MODES:
+            check = " \u2713" if mode == self._view_mode else ""
+            view_menu.add_command(label=f"  {mode}{check}",
+                                 command=lambda m=mode: self._menu_set_view(m))
+        menu.add_cascade(label="  View", menu=view_menu)
+
         # Size submenu
         size_menu = tk.Menu(menu, **menu_style)
         for name, scale in SIZES.items():
@@ -597,7 +910,7 @@ class BtcWidget(tk.Tk):
                                  command=lambda c=code: self._menu_set_currency(c))
         menu.add_cascade(label="  Currency", menu=curr_menu)
 
-        # Refresh interval submenu
+        # Refresh submenu
         ref_menu = tk.Menu(menu, **menu_style)
         for label, secs in REFRESH_OPTIONS:
             check = " \u2713" if self._refresh_s == secs else ""
@@ -605,21 +918,40 @@ class BtcWidget(tk.Tk):
                                 command=lambda s=secs: self._menu_set_refresh(s))
         menu.add_cascade(label="  Refresh", menu=ref_menu)
 
+        # Opacity submenu
+        opa_menu = tk.Menu(menu, **menu_style)
+        for label, val in OPACITY_OPTIONS:
+            check = " \u2713" if abs(self._opacity - val) < 0.01 else ""
+            opa_menu.add_command(label=f"  {label}{check}",
+                                command=lambda v=val: self._menu_set_opacity(v))
+        menu.add_cascade(label="  Opacity", menu=opa_menu)
+
+        # Border color submenu
+        brd_menu = tk.Menu(menu, **menu_style)
+        for name in BORDER_COLORS:
+            check = " \u2713" if name == self._border_color else ""
+            brd_menu.add_command(label=f"  {name}{check}",
+                                command=lambda n=name: self._menu_set_border(n))
+        menu.add_cascade(label="  Border", menu=brd_menu)
+
         # Always on top toggle
         top_check = " \u2713" if self._topmost else ""
         menu.add_command(label=f"  Always on top{top_check}",
                          command=self._menu_toggle_topmost)
 
+        # Price flash toggle
+        flash_check = " \u2713" if self._flash_enabled else ""
+        menu.add_command(label=f"  Price flash{flash_check}",
+                         command=self._menu_toggle_flash)
+
         menu.add_separator()
         menu.add_command(label="  Close", command=self._menu_quit)
 
         menu.tk_popup(e.x_root, e.y_root)
-        # Clean up when menu is dismissed (item click, Escape, or click-away)
         menu.bind("<Unmap>", self._on_popup_close)
         return "break"
 
     def _on_popup_close(self, _event=None):
-        """Release any stale grab left by tk_popup and clean up the menu."""
         self._popup = None
         try:
             self.grab_release()
@@ -627,7 +959,6 @@ class BtcWidget(tk.Tk):
             pass
 
     def _menu_set_size(self, scale):
-        # Let native popup close itself, then rebuild after a short delay
         self.after(30, lambda: self._do_set_size(scale))
 
     def _do_set_size(self, scale):
@@ -646,6 +977,8 @@ class BtcWidget(tk.Tk):
     def _do_set_currency(self, code):
         self._currency = code
         self._last_price_str = None
+        self._last_display_str = None
+        self._prev_price = None
         pos_x, pos_y = self.winfo_x(), self.winfo_y()
         self._build_ui(self._num_digits)
         self._bind_children()
@@ -659,9 +992,49 @@ class BtcWidget(tk.Tk):
         self._refresh_s = secs
         self._save_config()
 
+    def _menu_set_opacity(self, val):
+        self._opacity = val
+        self.wm_attributes("-alpha", val)
+        self._save_config()
+
+    def _menu_set_view(self, mode):
+        if mode == self._view_mode:
+            return
+        self.after(30, lambda: self._do_set_view(mode))
+
+    def _do_set_view(self, mode):
+        self._view_mode = mode
+        self._last_display_str = None
+        self._prev_price = None
+        pos_x, pos_y = self.winfo_x(), self.winfo_y()
+        self._build_ui(self._num_digits)
+        self._bind_children()
+        self.geometry(f"+{pos_x}+{pos_y}")
+        self._save_config()
+        for dp in self._digit_panels:
+            dp.set("-")
+        self._fetch_loop()
+
+    def _menu_set_border(self, name):
+        if name == self._border_color:
+            return
+        self.after(30, lambda: self._do_set_border(name))
+
+    def _do_set_border(self, name):
+        self._border_color = name
+        pos_x, pos_y = self.winfo_x(), self.winfo_y()
+        self._build_ui(self._num_digits)
+        self._bind_children()
+        self.geometry(f"+{pos_x}+{pos_y}")
+        self._save_config()
+
     def _menu_toggle_topmost(self):
         self._topmost = not self._topmost
         self.wm_attributes("-topmost", self._topmost)
+        self._save_config()
+
+    def _menu_toggle_flash(self):
+        self._flash_enabled = not self._flash_enabled
         self._save_config()
 
     def _menu_quit(self):
@@ -669,5 +1042,5 @@ class BtcWidget(tk.Tk):
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    app = BtcWidget()
+    app = Tickoshi()
     app.mainloop()
