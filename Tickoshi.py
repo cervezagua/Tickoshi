@@ -819,7 +819,14 @@ class Tickoshi(tk.Tk):
         self._fetch_gen = 0            # latest fetch generation; stale workers no-op
 
         # Frameless, always-on-top
-        self.overrideredirect(True)
+        if sys.platform.startswith("linux"):
+            # X11: overrideredirect(True) makes the window unmanaged, so the
+            # WM ignores -topmost (the widget is stuck above managed windows
+            # on most WMs/compositors). Use _NET_WM_WINDOW_TYPE=splash instead
+            # for a borderless, WM-managed window where -topmost works.
+            self.wm_attributes("-type", "splash")
+        else:
+            self.overrideredirect(True)
         self.wm_attributes("-topmost", self._topmost)
         self.wm_attributes("-alpha", self._opacity)
         self.configure(bg=C_FACE)
