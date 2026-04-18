@@ -1,0 +1,27 @@
+# Build artifacts
+build/
+dist/
+*.spec
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Claude
+.claude/
+
+# Screenshots (local testing)
+screenshot*.png
+
+# Runtime (in case a dev run writes to cwd)
+tickoshi_debug.log
+tickoshi_config.json
