@@ -7,6 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Run from source: `pip install websocket-client && python Tickoshi.py` (Python 3.10+; Linux also needs `python3-tk`)
 - Build Windows EXE: `BUILD.bat` → `dist\Tickoshi.exe` (PyInstaller `--onefile --windowed`; auto-installs pyinstaller, pillow, websocket-client; kills a running Tickoshi.exe first)
 - Build Linux binary: `./BUILD.sh` → `dist/Tickoshi` plus a `~/.local/share/applications/tickoshi.desktop` launcher
+- Build macOS .app: `./BUILD.command` → `dist/Tickoshi.app` (ad-hoc signed via `codesign --sign -`, no Apple Developer ID) plus `dist/Tickoshi-macos.zip` (via `ditto`) for release upload. First launch still trips Gatekeeper — right-click → Open or `xattr -d com.apple.quarantine`.
 - No test suite, linter, or formatter is configured. There is no `requirements.txt` — the single runtime dependency (`websocket-client`) is installed manually or by the build scripts.
 
 ## Architecture
@@ -38,9 +39,10 @@ Optional tiles are declared in the `MODULES` list (`key`, menu label). Enabled k
 ### Config and logs
 Settings autosave on every change to a JSON file next to a rolling 200-line debug log (`_debug_log`):
 - Windows: `%APPDATA%\Tickoshi\tickoshi_config.json` / `tickoshi_debug.log`
+- macOS: `~/Library/Application Support/Tickoshi/` (same filenames)
 - Linux: `~/.config/Tickoshi/` (same filenames)
 
 `config_path()` resolves the platform-specific location. The debug log is primarily for diagnosing the WebSocket feed.
 
 ### Packaging note
-`BUILD.bat` / `BUILD.sh` aggressively exclude heavy stdlib/third-party modules (numpy, pandas, matplotlib, smtplib, http.server, etc.) to keep the onefile binary small. If you add an import that transitively pulls one of these in, update the exclude list or the build will ship a much larger EXE.
+`BUILD.bat` / `BUILD.sh` / `BUILD.command` aggressively exclude heavy stdlib/third-party modules (numpy, pandas, matplotlib, smtplib, http.server, etc.) to keep the onefile binary small. If you add an import that transitively pulls one of these in, update the exclude list in all three scripts or the build will ship a much larger binary.

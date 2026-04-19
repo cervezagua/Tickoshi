@@ -16,7 +16,9 @@ import time
 import websocket
 
 # ── Platform font ─────────────────────────────────────────────────────────────
-if os.name == "nt":
+if sys.platform == "darwin":
+    _FONT_FAMILY = "Helvetica Neue"
+elif os.name == "nt":
     _FONT_FAMILY = "Segoe UI"
 else:
     _FONT_FAMILY = "DejaVu Sans"
@@ -128,6 +130,9 @@ def _smoothstep(t: float) -> float:
 def config_path() -> str:
     if os.name == "nt":                        # Windows
         base = os.environ.get("APPDATA", os.path.expanduser("~"))
+    elif sys.platform == "darwin":             # macOS
+        base = os.path.join(os.path.expanduser("~"),
+                            "Library", "Application Support")
     else:                                      # Linux
         base = os.environ.get("XDG_CONFIG_HOME",
                               os.path.join(os.path.expanduser("~"), ".config"))
@@ -840,6 +845,12 @@ class Tickoshi(tk.Tk):
         self.bind("<ButtonRelease-1>", self._de)
         self.bind("<Double-Button-1>", self._copy_to_clipboard)
         self.bind_all("<ButtonPress-3>", self._show_menu)
+        if sys.platform == "darwin":
+            # macOS: Button-2 fires from some trackpad secondary-click configs;
+            # Ctrl-click is the canonical Mac fallback. _show_menu doesn't
+            # inspect which button fired, so aliasing both is safe.
+            self.bind_all("<ButtonPress-2>", self._show_menu)
+            self.bind_all("<Control-Button-1>", self._show_menu)
         self._bind_children()
 
         self._start_result_poller()

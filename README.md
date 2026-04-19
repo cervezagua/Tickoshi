@@ -9,12 +9,12 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.0-orange?style=flat-square" />
+  <img src="https://img.shields.io/badge/version-1.1-orange?style=flat-square" />
 </p>
 
 <p align="center">
   <img src="https://img.shields.io/badge/Python-3.10%2B-blue?style=flat-square&logo=python&logoColor=white" />
-  <img src="https://img.shields.io/badge/Platform-Windows%20%7C%20Linux-lightgrey?style=flat-square" />
+  <img src="https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey?style=flat-square" />
 </p>
 <p align="center">
 <img width="463" height="280" alt="image" src="https://github.com/user-attachments/assets/e5c99cbf-b545-4157-b1db-3e740005ea28" />
@@ -80,7 +80,23 @@ chmod +x BUILD.sh
 
 Produces `dist/Tickoshi` — a single ELF binary. A `.desktop` launcher is also created automatically at `~/.local/share/applications/tickoshi.desktop`.
 
-> Both build scripts install PyInstaller, Pillow, and `websocket-client` automatically if they aren't already present.
+### macOS
+
+Double-click **`BUILD.command`** in Finder, or run from a terminal:
+
+```bash
+chmod +x BUILD.command
+./BUILD.command
+```
+
+Produces `dist/Tickoshi.app` (ad-hoc signed) and `dist/Tickoshi-macos.zip` (ready for release upload).
+
+> **First launch (Gatekeeper):** macOS will refuse to open the app because it isn't notarized. Right-click the app → **Open** (then confirm), or run:
+> ```bash
+> xattr -d com.apple.quarantine dist/Tickoshi.app
+> ```
+
+> All three build scripts install PyInstaller, Pillow, and `websocket-client` automatically if they aren't already present.
 
 ---
 
@@ -140,6 +156,7 @@ Settings are saved automatically when you move, resize, or change any option.
 | Platform | Location |
 |---|---|
 | Windows | `%APPDATA%\Tickoshi\tickoshi_config.json` |
+| macOS | `~/Library/Application Support/Tickoshi/tickoshi_config.json` |
 | Linux | `~/.config/Tickoshi/tickoshi_config.json` |
 
 A rolling `tickoshi_debug.log` (last 200 lines) sits alongside the config for troubleshooting the WebSocket feed.
@@ -161,6 +178,11 @@ A rolling `tickoshi_debug.log` (last 200 lines) sits alongside the config for tr
 ---
 
 ## Release notes
+
+### 1.1
+
+- **macOS support.** New `BUILD.command` produces an ad-hoc signed `Tickoshi.app` bundle.
+- Config stored at `~/Library/Application Support/Tickoshi/` on macOS; Ctrl-click / two-finger-click open the menu.
 
 ### 1.0
 
