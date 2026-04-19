@@ -16,8 +16,9 @@
   <img src="https://img.shields.io/badge/Python-3.10%2B-blue?style=flat-square&logo=python&logoColor=white" />
   <img src="https://img.shields.io/badge/Platform-Windows%20%7C%20Linux-lightgrey?style=flat-square" />
 </p>
-
----
+<p align="center">
+<img width="463" height="280" alt="image" src="https://github.com/user-attachments/assets/e5c99cbf-b545-4157-b1db-3e740005ea28" />
+</p>
 
 ## Features
 
