@@ -977,13 +977,17 @@ class Tickoshi(tk.Tk):
                                    bg=C_FACE, highlightthickness=0)
         self._frame_cv.pack()
 
-        # Linux X11 note: with overrideredirect(True) the WM doesn't always
-        # resize the toplevel to match the packed canvas, so after a rebuild
-        # that grows the layout (e.g. a full-width fees row or an odd
-        # trailing single tile) the window keeps its previous height and
-        # crops the top/bottom. Pin the toplevel size explicitly; callers
-        # still apply the "+x+y" position afterwards.
+        # With overrideredirect(True) on Windows and -type=splash on Linux,
+        # the WM doesn't always auto-resize the toplevel to match the packed
+        # canvas — after a rebuild that grows the layout (fees row or an odd
+        # trailing single tile rendering full-width) the window can keep its
+        # previous height and crop the top/bottom. Flush any pending
+        # pack-driven configure BEFORE pinning the explicit size, then flush
+        # again AFTER so our geometry request is the last thing the WM sees.
+        # The pre-flush matters on Windows 11, the post-flush on X11.
+        self.update_idletasks()
         self.geometry(f"{total_w}x{total_h}")
+        self.update_idletasks()
 
         # Smooth outer border polygon
         r = max(4, int(6 * s))
