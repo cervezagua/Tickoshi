@@ -56,6 +56,9 @@ echo " [1/4] Checking dependencies..."
 pip3 show pyinstaller      &>/dev/null || pip3 install --user "pyinstaller>=6.0"
 pip3 show pillow           &>/dev/null || pip3 install --user "pillow>=10.0"
 pip3 show websocket-client &>/dev/null || pip3 install --user "websocket-client>=1.6"
+# certifi supplies the CA bundle the app falls back to on macOS, where
+# Python's OpenSSL can't read the system Keychain (see Tickoshi.py header).
+pip3 show certifi          &>/dev/null || pip3 install --user "certifi"
 
 # ── Clean ─────────────────────────────────────────────────
 echo " [2/4] Cleaning previous build..."

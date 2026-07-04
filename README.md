@@ -96,7 +96,9 @@ Produces `dist/Tickoshi.app` (ad-hoc signed) and `dist/Tickoshi-macos.zip` (read
 > xattr -d com.apple.quarantine dist/Tickoshi.app
 > ```
 
-> All three build scripts install PyInstaller, Pillow, and `websocket-client` automatically if they aren't already present.
+> **macOS + HTTPS:** Python's OpenSSL on macOS can't read the system Keychain, so the app falls back to [`certifi`](https://pypi.org/project/certifi/)'s CA bundle (installed and bundled by `BUILD.command` automatically). Builds made before this fix show no data at all — every HTTPS/WSS request failed certificate verification. Rebuild with the current `BUILD.command` to fix.
+
+> All three build scripts install PyInstaller, Pillow, and `websocket-client` automatically if they aren't already present (plus `certifi` on macOS).
 
 ---
 
