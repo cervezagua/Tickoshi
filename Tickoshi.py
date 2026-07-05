@@ -604,11 +604,13 @@ class SignPanel(tk.Canvas):
         # Card background
         self._draw_rr(pad, pad, pad+pw, pad+ph, r, fill=C_PANEL_BG, outline="")
 
-        # Border
+        # Border — fill="" is required: Tk's default polygon fill is a dynamic
+        # system color on macOS Aqua (white in dark mode), which would paint
+        # over the card and hide the text.
         self._draw_rr(1, 1, pw+pad*2-2, ph+pad*2-2, r+2,
-                      outline=self._border_lo, width=1)
+                      fill="", outline=self._border_lo, width=1)
         self._draw_rr(pad-2, pad-2, pw+pad+2, ph+pad+2, r+1,
-                      outline=self._border_hi, width=1)
+                      fill="", outline=self._border_hi, width=1)
 
         # Symbol text
         cx = pad + pw // 2
@@ -669,9 +671,11 @@ class LabelPanel(tk.Canvas):
         # Card background
         self._rr(pad, pad, pad+pw, pad+ph, r, fill=C_PANEL_BG, outline="")
 
-        # Border
-        self._rr(1, 1, pw+pad*2-2, ph+pad*2-2, r+2, outline=self._border_lo, width=1)
-        self._rr(pad-2, pad-2, pw+pad+2, ph+pad+2, r+1, outline=self._border_hi, width=1)
+        # Border — fill="" is required: Tk's default polygon fill is a dynamic
+        # system color on macOS Aqua (white in dark mode), which would paint
+        # over the card and hide the text.
+        self._rr(1, 1, pw+pad*2-2, ph+pad*2-2, r+2, fill="", outline=self._border_lo, width=1)
+        self._rr(pad-2, pad-2, pw+pad+2, ph+pad+2, r+1, fill="", outline=self._border_hi, width=1)
 
         font_bold = (_FONT_FAMILY, fs, "bold")
 
@@ -744,11 +748,13 @@ class FeeBlock(tk.Canvas):
         # Card background
         self._rr(pad, pad, pad+pw, pad+ph, r, fill=C_PANEL_BG, outline="")
 
-        # Border
+        # Border — fill="" is required: Tk's default polygon fill is a dynamic
+        # system color on macOS Aqua (white in dark mode), which would paint
+        # over the card and hide the text.
         self._rr(1, 1, pw+pad*2-2, ph+pad*2-2, r+2,
-                 outline=self._border_lo, width=1)
+                 fill="", outline=self._border_lo, width=1)
         self._rr(pad-2, pad-2, pw+pad+2, ph+pad+2, r+1,
-                 outline=self._border_hi, width=1)
+                 fill="", outline=self._border_hi, width=1)
 
         # Horizontal layout: [ LABEL | VALUE  unit ]
         left_cx   = pad + int(pw * 0.19)
