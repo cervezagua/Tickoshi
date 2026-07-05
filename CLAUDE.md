@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Run from source: `pip install websocket-client && python Tickoshi.py` (Python 3.10+; Linux also needs `python3-tk`)
 - Build Windows EXE: `BUILD.bat` → `dist\Tickoshi.exe` (PyInstaller `--onefile --windowed`; auto-installs pyinstaller, pillow, websocket-client; kills a running Tickoshi.exe first)
 - Build Linux binary: `./BUILD.sh` → `dist/Tickoshi` plus a `~/.local/share/applications/tickoshi.desktop` launcher
-- Build macOS .app: `./BUILD.command` → `dist/Tickoshi.app` (ad-hoc signed via `codesign --sign -`, no Apple Developer ID) plus `dist/Tickoshi-macos.zip` (via `ditto`) for release upload. First launch still trips Gatekeeper — right-click → Open or `xattr -d com.apple.quarantine`.
+- Build macOS .app: `./BUILD.command` → `dist/Tickoshi.app` (ad-hoc signed via `codesign --sign -`, no Apple Developer ID) plus `dist/Tickoshi-macos.zip` (via `ditto`) for release upload. First launch still trips Gatekeeper — right-click → Open or `xattr -d com.apple.quarantine`. Also installs/bundles `certifi`: on macOS Python's OpenSSL can't read the system Keychain, so a darwin-gated block at the top of `Tickoshi.py` points `SSL_CERT_FILE` at certifi's bundle when the default trust store is empty — without it every HTTPS/WSS fetch fails `CERTIFICATE_VERIFY_FAILED`. `certifi` is macOS-only and explicitly `--exclude-module`d in `BUILD.bat`/`BUILD.sh`.
 - No test suite, linter, or formatter is configured. There is no `requirements.txt` — the single runtime dependency (`websocket-client`) is installed manually or by the build scripts.
 
 ## Architecture

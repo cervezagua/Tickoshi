@@ -15,6 +15,21 @@ import urllib.error
 import time
 import websocket
 
+# ── macOS SSL trust store fix ─────────────────────────────────────────────────
+# CPython on macOS links its own OpenSSL, which can't read the system Keychain;
+# inside a PyInstaller bundle the baked-in cert path doesn't exist either, so
+# every HTTPS/WSS handshake fails CERTIFICATE_VERIFY_FAILED. Point OpenSSL at
+# certifi's bundle — but only when the default store is actually empty, so a
+# healthy setup is never overridden.
+if sys.platform == "darwin":
+    import ssl
+    try:
+        if ssl.create_default_context().cert_store_stats()["x509_ca"] == 0:
+            import certifi
+            os.environ.setdefault("SSL_CERT_FILE", certifi.where())
+    except Exception:
+        pass
+
 # ── Platform font ─────────────────────────────────────────────────────────────
 if sys.platform == "darwin":
     _FONT_FAMILY = "Helvetica Neue"
@@ -284,8 +299,8 @@ def _fetch_all_prices():
                 if gid in data.get("bitcoin", {}):
                     _price_cache[gid] = float(data["bitcoin"][gid])
         primary_ok = True
-    except Exception:
-        pass
+    except Exception as e:
+        _debug_log(f"http price fetch failed (coingecko): {type(e).__name__}: {e}")
 
     # Binance fallback when CoinGecko is unreachable.
     if not primary_ok:
@@ -297,7 +312,8 @@ def _fetch_all_prices():
                     data = json.loads(r.read().decode())
                 with _price_cache_lock:
                     _price_cache[gid] = float(data["price"])
-            except Exception:
+            except Exception as e:
+                _debug_log(f"http price fetch failed (binance {bsym}): {type(e).__name__}: {e}")
                 continue
 
     return bool(_price_cache)
@@ -588,11 +604,13 @@ class SignPanel(tk.Canvas):
         # Card background
         self._draw_rr(pad, pad, pad+pw, pad+ph, r, fill=C_PANEL_BG, outline="")
 
-        # Border
+        # Border — fill="" is required: Tk's default polygon fill is a dynamic
+        # system color on macOS Aqua (white in dark mode), which would paint
+        # over the card and hide the text.
         self._draw_rr(1, 1, pw+pad*2-2, ph+pad*2-2, r+2,
-                      outline=self._border_lo, width=1)
+                      fill="", outline=self._border_lo, width=1)
         self._draw_rr(pad-2, pad-2, pw+pad+2, ph+pad+2, r+1,
-                      outline=self._border_hi, width=1)
+                      fill="", outline=self._border_hi, width=1)
 
         # Symbol text
         cx = pad + pw // 2
@@ -653,9 +671,11 @@ class LabelPanel(tk.Canvas):
         # Card background
         self._rr(pad, pad, pad+pw, pad+ph, r, fill=C_PANEL_BG, outline="")
 
-        # Border
-        self._rr(1, 1, pw+pad*2-2, ph+pad*2-2, r+2, outline=self._border_lo, width=1)
-        self._rr(pad-2, pad-2, pw+pad+2, ph+pad+2, r+1, outline=self._border_hi, width=1)
+        # Border — fill="" is required: Tk's default polygon fill is a dynamic
+        # system color on macOS Aqua (white in dark mode), which would paint
+        # over the card and hide the text.
+        self._rr(1, 1, pw+pad*2-2, ph+pad*2-2, r+2, fill="", outline=self._border_lo, width=1)
+        self._rr(pad-2, pad-2, pw+pad+2, ph+pad+2, r+1, fill="", outline=self._border_hi, width=1)
 
         font_bold = (_FONT_FAMILY, fs, "bold")
 
@@ -728,11 +748,13 @@ class FeeBlock(tk.Canvas):
         # Card background
         self._rr(pad, pad, pad+pw, pad+ph, r, fill=C_PANEL_BG, outline="")
 
-        # Border
+        # Border — fill="" is required: Tk's default polygon fill is a dynamic
+        # system color on macOS Aqua (white in dark mode), which would paint
+        # over the card and hide the text.
         self._rr(1, 1, pw+pad*2-2, ph+pad*2-2, r+2,
-                 outline=self._border_lo, width=1)
+                 fill="", outline=self._border_lo, width=1)
         self._rr(pad-2, pad-2, pw+pad+2, ph+pad+2, r+1,
-                 outline=self._border_hi, width=1)
+                 fill="", outline=self._border_hi, width=1)
 
         # Horizontal layout: [ LABEL | VALUE  unit ]
         left_cx   = pad + int(pw * 0.19)

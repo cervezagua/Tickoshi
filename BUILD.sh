@@ -77,6 +77,7 @@ pyinstaller \
   --exclude-module poplib \
   --exclude-module smtplib \
   --exclude-module telnetlib \
+  --exclude-module certifi \
   Tickoshi.py
 
 # ── Result ────────────────────────────────────────────────
