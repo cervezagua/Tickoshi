@@ -53,12 +53,16 @@ echo ""
 
 # ── Dependencies ──────────────────────────────────────────
 echo " [1/4] Checking dependencies..."
-pip3 show pyinstaller      &>/dev/null || pip3 install --user "pyinstaller>=6.0"
-pip3 show pillow           &>/dev/null || pip3 install --user "pillow>=10.0"
-pip3 show websocket-client &>/dev/null || pip3 install --user "websocket-client>=1.6"
+# Everything goes through `python3 -m` — on Macs with several Pythons
+# (Homebrew, python.org, Xcode CLT), bare `pip3` can belong to a different
+# interpreter than `python3`, and --user console scripts land in
+# ~/Library/Python/3.x/bin which is not on PATH.
+python3 -m pip show pyinstaller      &>/dev/null || python3 -m pip install --user "pyinstaller>=6.0"
+python3 -m pip show pillow           &>/dev/null || python3 -m pip install --user "pillow>=10.0"
+python3 -m pip show websocket-client &>/dev/null || python3 -m pip install --user "websocket-client>=1.6"
 # certifi supplies the CA bundle the app falls back to on macOS, where
 # Python's OpenSSL can't read the system Keychain (see Tickoshi.py header).
-pip3 show certifi          &>/dev/null || pip3 install --user "certifi"
+python3 -m pip show certifi          &>/dev/null || python3 -m pip install --user "certifi"
 
 # ── Clean ─────────────────────────────────────────────────
 echo " [2/4] Cleaning previous build..."
@@ -73,7 +77,7 @@ if [ -f "Tickoshi.icns" ]; then
     ICON_ARG=(--icon "Tickoshi.icns")
 fi
 
-pyinstaller \
+python3 -m PyInstaller \
   --onefile \
   --windowed \
   --name "Tickoshi" \
