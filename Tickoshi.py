@@ -12,6 +12,7 @@ import os
 import sys
 import urllib.request
 import urllib.error
+import urllib.parse
 import socket
 import time
 import websocket
@@ -332,7 +333,32 @@ _TLS_RESIGNED_MARKERS = ("Missing Authority Key Identifier",
                          "unable to get local issuer certificate")
 _tls_hint_logged = False
 
-def _note_if_intercepted(exc):
+def _probe_cleartext_responder(host):
+    """After a TLS failure, ask port 443 in plaintext who is answering.
+
+    A filtering middlebox terminates the connection itself and replies in
+    cleartext — typically a redirect to its own block page, which names the
+    operator outright. A real HTTPS server answers such a request with a bare
+    400 and no Location, so the two are easy to tell apart in the log. This
+    turns an opaque `WRONG_VERSION_NUMBER` into the name of the thing to go
+    and switch off. Sends nothing but an ordinary GET for "/".
+    """
+    try:
+        with socket.create_connection((host, 443), timeout=5) as sock:
+            sock.sendall(f"GET / HTTP/1.1\r\nHost: {host}\r\n"
+                         f"User-Agent: Tickoshi/1.0\r\n"
+                         f"Connection: close\r\n\r\n".encode())
+            data = sock.recv(1024).decode("ascii", "replace")
+    except Exception:
+        return
+    if not data.startswith("HTTP/"):
+        return
+    lines = [l.strip() for l in data.split("\r\n") if l.strip()]
+    keep = lines[:1] + [l for l in lines[1:]
+                        if l.split(":")[0].lower() in ("location", "via", "server")]
+    _debug_log(f"probe {host}:443 replied in cleartext — " + " | ".join(keep))
+
+def _note_if_intercepted(exc, host=None):
     """Say once per session when a TLS failure looks like filtering.
 
     Both shapes below mean something is inspecting HTTPS rather than the site
@@ -345,6 +371,9 @@ def _note_if_intercepted(exc):
     if _tls_hint_logged:
         return
     text = str(exc)
+    if any(m in text for m in _TLS_KILLED_MARKERS) and host:
+        # Ask who answered before deciding what to tell the user.
+        _probe_cleartext_responder(host)
     if any(m in text for m in _TLS_RESIGNED_MARKERS):
         _tls_hint_logged = True
         _debug_log("note: the certificate was signed locally, not by the "
@@ -389,7 +418,11 @@ def _http_get(url, timeout=8, what=""):
         return None, e.code
     except Exception as e:
         _debug_log(f"http {what} failed: {type(e).__name__}: {e}")
-        _note_if_intercepted(e)
+        try:
+            probe_host = urllib.parse.urlsplit(url).hostname
+        except Exception:
+            probe_host = None
+        _note_if_intercepted(e, probe_host)
     return None, None
 
 def _prices_coingecko():
