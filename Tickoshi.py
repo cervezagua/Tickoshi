@@ -1464,8 +1464,12 @@ class Tickoshi(tk.Tk):
                     fn = self._result_queue.get_nowait()
                     try:
                         fn()
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        # Swallowed so one bad result can't kill the poller,
+                        # but never silently — this is where a render fault
+                        # would otherwise vanish without trace.
+                        _debug_log(f"result callback failed: "
+                                   f"{type(e).__name__}: {e}")
             except queue.Empty:
                 pass
             if self.winfo_exists():
@@ -1493,19 +1497,28 @@ class Tickoshi(tk.Tk):
         needs_height = ("height" in modules) or ("halving" in modules)
 
         def _worker():
-            refreshed = _fetch_all_prices(currency)
-            if needs_height:
-                _fetch_block_height()
-            if "hash" in modules:
-                _fetch_hashrate()
-            # Fees + mempool are pushed via WebSocket — no HTTP fetch needed.
-            display = fetch_price(currency)
-            if not refreshed:
-                _debug_log(f"fetch cycle: no live {currency} price from any "
-                           f"source (showing "
-                           f"{'last known' if display else 'nothing'})")
-            self._result_queue.put(
-                lambda: self._on_fetch_done(display, currency, modules, gen))
+            # The queued callback is what schedules the next cycle, so it must
+            # be posted no matter what happens above it. An exception escaping
+            # this thread would stop the widget refreshing for the rest of the
+            # session — which looks exactly like "the price stopped working".
+            display = None
+            try:
+                refreshed = _fetch_all_prices(currency)
+                if needs_height:
+                    _fetch_block_height()
+                if "hash" in modules:
+                    _fetch_hashrate()
+                # Fees + mempool are pushed via WebSocket — no HTTP fetch here.
+                display = fetch_price(currency)
+                if not refreshed:
+                    _debug_log(f"fetch cycle: no live {currency} price from any "
+                               f"source (showing "
+                               f"{'last known' if display else 'nothing'})")
+            except Exception as e:
+                _debug_log(f"fetch worker crashed: {type(e).__name__}: {e}")
+            finally:
+                self._result_queue.put(
+                    lambda: self._on_fetch_done(display, currency, modules, gen))
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -1514,14 +1527,20 @@ class Tickoshi(tk.Tk):
         # and in particular don't reschedule, or we'd end up with two timers.
         if gen != self._fetch_gen:
             return
-        # Discard stale results from before a currency/module change.
-        if currency != self._currency or modules != frozenset(self._modules):
-            return
-        self._last_price_str = display
-        self._update_display(display)
-        if self.winfo_exists():
-            self._fetch_after_id = self.after(
-                self._refresh_s * 1000, self._fetch_loop)
+        try:
+            # Discard stale results from before a currency/module change; that
+            # change restarts the loop itself, so this cycle just stops here.
+            if (currency == self._currency
+                    and modules == frozenset(self._modules)):
+                self._last_price_str = display
+                self._update_display(display)
+        finally:
+            # Rescheduling has to survive a render error. The result poller
+            # swallows whatever is raised in here, so a single Tcl error
+            # escaping this method used to cancel every future refresh.
+            if gen == self._fetch_gen and self.winfo_exists():
+                self._fetch_after_id = self.after(
+                    self._refresh_s * 1000, self._fetch_loop)
 
     # ── Bindings ──────────────────────────────────────────────────────────────
     def _bind_children(self):
