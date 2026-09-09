@@ -26,10 +26,14 @@ The top-level `Tickoshi(tk.Tk)` class owns layout, the right-click menu, config 
 
 ### Data sources and threading
 Network I/O runs on background threads and hands results to the Tk main loop via a `queue.Queue` polled on the Tk timer — never touch Tk widgets from a worker thread.
-- Price: CoinGecko primary, Binance fallback (`_fetch_all_prices`). Polled on the user's refresh interval (1/5/15/30/60 min; `REFRESH_OPTIONS`).
-- Block height: `blockchain.info` (`_fetch_block_height`). Halving days are computed locally against `NEXT_HALVING_BLOCK = 1_050_000`.
+- Price: CoinGecko primary, Binance fallback (`_fetch_all_prices`). Polled on the user's refresh interval (1/5/15/30/60 min; `REFRESH_OPTIONS`) — but a cycle that fetched no live price reschedules on a short escalating backoff instead (`FETCH_RETRY_MIN_S`..`FETCH_RETRY_MAX_S`, see `_next_fetch_delay`). Windows refuses sockets (WinError 10013) for the first seconds of a process's life while the firewall clears the new binary, so the startup fetch routinely fails on a healthy machine; without the retry a 60-min interval left the price blank for an hour.
+- Block height: `blockchain.info` (`_fetch_block_height`). Halving days are computed locally by `calc_halving_days`, which derives the next halving from the height via `HALVING_INTERVAL` — don't reintroduce a hardcoded next-halving constant, it turns the tile into `--` forever once that block is mined.
 - Hashrate: mempool.space mining REST endpoint (`_fetch_hashrate`).
 - Fees + mempool size: persistent WebSocket to `wss://mempool.space/api/v1/ws` via `websocket-client`. Lifecycle is managed by the module-level `_ws_start` / `_ws_stop` / `_ws_run` and the `_ws_on_*` callbacks — the WS reconnects on its own and pushes updates independent of the poll interval. `_ws_run` takes a generation token so a run winding down from an earlier `_ws_stop()` retires instead of blocking a restart; reconnect backoff resets after a connection stays up `WS_STABLE_S`. These two tiles have no HTTP fallback, so they blank to `--` once the socket has been silent for `STALE_AFTER_S` rather than showing a dead feed's last reading as live.
+
+Two invariants hold the loop together, and both were bugs before:
+- The queued result is what arms the next cycle, so `_worker` posts it from a `finally` and `_on_fetch_done` reschedules from a `finally`. Never make either conditional on success, or one exception stops the widget refreshing for the rest of the session.
+- WebSocket tiles do **not** repaint on the price cycle. `_ws_on_message` sets `_ws_repaint`, and the result poller drains it (and ticks every ~5s so staleness blanking lands too). Read fee values through `_fee_values()` so the liveness gate is applied everywhere.
 
 When adding a new data source, follow the same pattern: fetch on a worker thread, push into the queue, render on the Tk tick.
 
@@ -42,7 +46,7 @@ Settings autosave on every change to a JSON file next to a rolling 200-line debu
 - macOS: `~/Library/Application Support/Tickoshi/` (same filenames)
 - Linux: `~/.config/Tickoshi/` (same filenames)
 
-`config_path()` resolves the platform-specific location. The debug log is the tool for diagnosing connectivity: every session opens with a `--- Tickoshi start` line (python/platform/websocket-client versions, CA-store size, which proxy env vars are set), and each network failure logs its HTTP status plus the server's error body, or the transport exception. Because the window is only 200 lines, per-message value logging is deduplicated — a repeated fee/mempool/hashrate value logs once, so connection errors are not scrolled away. Keep new log lines quiet on success for the same reason.
+`config_path()` resolves the platform-specific location. Everything read back is clamped by `_sanitize_config` and the window is kept on-screen by `_apply_position`: values flow straight into Tk (`geometry`, `-alpha`, `after`), the window is frameless with no taskbar entry, and under `--windowed` there is no console — so a bad saved value would otherwise make the app invisible or fail to start with nothing to show for it. The debug log is the tool for diagnosing connectivity: every session opens with a `--- Tickoshi start` line (python/platform/websocket-client versions, CA-store size, which proxy env vars are set), and each network failure logs its HTTP status plus the server's error body, or the transport exception. Because the window is only 200 lines, per-message value logging is deduplicated — a repeated fee/mempool/hashrate value logs once, so connection errors are not scrolled away. Keep new log lines quiet on success for the same reason.
 
 All HTTP fetches go through `_http_get()`, which centralizes the User-Agent, timeout, and that failure logging.
 

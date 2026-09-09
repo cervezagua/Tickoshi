@@ -51,6 +51,15 @@ REFRESH_OPTIONS = [
     ("1 hr",    3600),
 ]
 
+# A refresh interval is how often to poll when polling WORKS. A cycle that
+# fetched nothing has to come back sooner than that: sockets are commonly
+# unavailable for the first seconds of a process's life on Windows (WinError
+# 10013, while the firewall clears the newly launched binary), so the startup
+# fetch can fail on a machine whose network is perfectly healthy. Waiting out
+# a 15- or 60-minute interval after that leaves the price blank for that long.
+FETCH_RETRY_MIN_S = 5
+FETCH_RETRY_MAX_S = 60
+
 DRUM_STEPS = 12
 DRUM_MS    = 14
 
@@ -96,7 +105,7 @@ BORDER_COLORS = {
 }
 
 # Next Bitcoin halving block
-NEXT_HALVING_BLOCK = 1_050_000
+HALVING_INTERVAL = 210_000
 
 # Border pulse animation (price up/down flash)
 PULSE_MS         = 30     # ms per animation step
@@ -295,6 +304,10 @@ _price_cache_lock = threading.Lock()
 # but a socket that has pushed nothing at all for this long is dead.
 STALE_AFTER_S = 600
 _ws_alive_ts = None   # time of the last message accepted from the WebSocket
+# Set by the WS thread when a pushed value changes; the Tk poller drains it.
+# These feeds push every few seconds, so hanging their repaint off the price
+# cycle showed fee/mempool numbers a whole refresh interval out of date.
+_ws_repaint = threading.Event()
 
 def _is_fresh(ts) -> bool:
     return isinstance(ts, (int, float)) and (time.time() - ts) < STALE_AFTER_S
@@ -485,9 +498,17 @@ def _log_startup_env():
     proxy_vars = sorted(k for k in os.environ
                         if k.lower() in ("http_proxy", "https_proxy",
                                          "all_proxy", "no_proxy"))
+    try:
+        # On Windows urllib takes its proxy from the registry, not the
+        # environment, so the env vars alone can read "none" on a machine that
+        # is in fact proxied. Schemes only — proxy URLs carry credentials.
+        proxies = sorted(urllib.request.getproxies())
+    except Exception:
+        proxies = "unavailable"
     _debug_log(f"--- {APP_NAME} start  python={sys.version.split()[0]} "
                f"platform={sys.platform}  websocket-client={ws_ver}  "
-               f"ca_certs={ca_count}  proxy_env={proxy_vars or 'none'}")
+               f"ca_certs={ca_count}  proxy_env={proxy_vars or 'none'}  "
+               f"proxies={proxies or 'none'}")
 
 # ── Mempool.space WebSocket: source of truth for Priority tile values ─────────
 # Public, free endpoint. Pushes live `fees` object with fractional sat/vB values
@@ -543,6 +564,7 @@ def _ws_on_message(ws, raw):
             _fees_cache["med"]  = _fmt_fee(med)
             _fees_cache["low"]  = _fmt_fee(low)
             shown = (_fees_cache["high"], _fees_cache["med"], _fees_cache["low"])
+        _ws_repaint.set()
         # mempool.space re-pushes fees every few seconds. Logging every push
         # rolled connection errors out of the 200-line window within minutes,
         # so only a change earns a line.
@@ -562,6 +584,7 @@ def _ws_on_message(ws, raw):
             with _price_cache_lock:
                 _network_cache["mempool_mb"] = vbytes / 1_000_000.0
                 mb = _network_cache["mempool_mb"]
+            _ws_repaint.set()
             if _ws_logged.get("mempool") != round(mb, 2):
                 _ws_logged["mempool"] = round(mb, 2)
                 _debug_log(f"ws mempool  bytes={vbytes} -> {mb:.2f} MB")
@@ -575,6 +598,7 @@ def _ws_on_message(ws, raw):
                 _network_cache["hashrate_ehs"] = hr / 1e18
                 _network_cache["hashrate_ts"] = time.time()
                 ehs = _network_cache["hashrate_ehs"]
+            _ws_repaint.set()
             if _ws_logged.get("hashrate") != round(ehs, 2):
                 _ws_logged["hashrate"] = round(ehs, 2)
                 _debug_log(f"ws hashrate  H/s={hr} -> {ehs:.2f} EH/s")
@@ -664,8 +688,12 @@ def _ws_start():
     _debug_log("ws start requested")
 
 def _ws_stop():
-    global _ws_gen, _ws_running, _ws_app
+    global _ws_gen, _ws_running, _ws_app, _ws_alive_ts
     with _ws_lock:
+        # Forget the old connection's liveness, or re-enabling a tile within
+        # STALE_AFTER_S would render the pre-stop values as live before the
+        # new socket has delivered anything.
+        _ws_alive_ts = None
         _ws_gen += 1
         _ws_running = False
         _ws_stop_flag.set()
@@ -685,10 +713,16 @@ def fetch_price(currency: str = "USD") -> str | None:
         return str(int(round(price)))
     return None
 
+def next_halving_block(height: int) -> int:
+    """The next halving at or after `height`. Derived rather than hardcoded: a
+    fixed constant silently turns the tile into "--" forever once that block
+    is mined, in every binary already shipped."""
+    return (height // HALVING_INTERVAL + 1) * HALVING_INTERVAL
+
 def calc_halving_days(height: int) -> int | None:
-    if height is None or height >= NEXT_HALVING_BLOCK:
+    if not isinstance(height, int) or height < 0:
         return None
-    blocks_remaining = NEXT_HALVING_BLOCK - height
+    blocks_remaining = next_halving_block(height) - height
     minutes_remaining = blocks_remaining * 10
     return int(minutes_remaining / 60 / 24)
 
@@ -1014,6 +1048,7 @@ class Tickoshi(tk.Tk):
         self._result_queue = queue.Queue()
         self._fetch_after_id = None    # pending fetch-loop timer
         self._fetch_gen = 0            # latest fetch generation; stale workers no-op
+        self._fetch_retry_s = 0        # backoff after a cycle that got nothing
 
         # Frameless, always-on-top
         if sys.platform.startswith("linux"):
@@ -1073,6 +1108,12 @@ class Tickoshi(tk.Tk):
             print(f"[Tickoshi] Failed to load config {path}: {e}",
                   file=sys.stderr)
             return {"x": 100, "y": 100, "scale": 1.0, "currency": "USD"}
+        if not isinstance(cfg, dict):
+            # Valid JSON that isn't an object (null, a list, a bare string)
+            # reached .get() below and raised AttributeError at startup.
+            print(f"[Tickoshi] Ignoring malformed config {path}",
+                  file=sys.stderr)
+            return {"x": 100, "y": 100, "scale": 1.0, "currency": "USD"}
         # Migrate removed 30s refresh option up to 1 min.
         if isinstance(cfg.get("refresh_s"), (int, float)):
             cfg["refresh_s"] = max(60, int(cfg["refresh_s"]))
@@ -1092,6 +1133,33 @@ class Tickoshi(tk.Tk):
             }
             cfg["modules"] = mapping.get(legacy, [])
             cfg.pop("view_mode", None)
+        return self._sanitize_config(cfg)
+
+    @staticmethod
+    def _sanitize_config(cfg: dict) -> dict:
+        """Clamp saved values to usable ranges.
+
+        These go straight into Tk (`geometry`, `-alpha`, `after`), so a
+        hand-edited or half-written file could otherwise crash startup — and
+        under PyInstaller's --windowed there is no console to show the
+        traceback, so the app would simply never appear.
+        """
+        def num(key, lo, hi, default):
+            v = cfg.get(key, default)
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                return default
+            return min(max(float(v), lo), hi)
+
+        cfg["scale"]     = num("scale", 0.5, 3.0, 1.0)
+        cfg["opacity"]   = num("opacity", 0.2, 1.0, 0.97)
+        cfg["refresh_s"] = int(num("refresh_s", 60, 86_400, 60))
+        cfg["x"]         = int(num("x", -32_000, 32_000, 100))
+        cfg["y"]         = int(num("y", -32_000, 32_000, 100))
+        if not isinstance(cfg.get("modules"), list):
+            cfg["modules"] = []
+        for flag in ("topmost", "flash", "locked"):
+            if flag in cfg and not isinstance(cfg[flag], bool):
+                cfg.pop(flag)
         return cfg
 
     def _save_config(self):
@@ -1124,6 +1192,21 @@ class Tickoshi(tk.Tk):
     def _apply_position(self):
         x = self._cfg.get("x", 100)
         y = self._cfg.get("y", 100)
+        # The window is frameless with no taskbar entry, so one restored onto
+        # a since-disconnected monitor is invisible AND unreachable — there is
+        # nothing to right-click to get the menu back. Keep it on the screen.
+        try:
+            self.update_idletasks()
+            sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+            w = max(self.winfo_reqwidth(), 1)
+            h = max(self.winfo_reqheight(), 1)
+            if not (-w // 2 <= x <= sw - w // 2 and -h // 2 <= y <= sh - h // 2):
+                _debug_log(f"saved position {x},{y} is off-screen "
+                           f"({sw}x{sh}); recentering")
+                x = max(0, (sw - w) // 2)
+                y = max(0, (sh - h) // 2)
+        except Exception:
+            pass
         self.geometry(f"+{x}+{y}")
 
     # ── UI Build ───────────────────────────────────────────────────────────────
@@ -1244,11 +1327,7 @@ class Tickoshi(tk.Tk):
                               line_color=self._bc("line"))
                 fb.pack(side="left", padx=(0, gap if i < 2 else 0))
                 self._fee_panels.append(fb)
-            with _price_cache_lock:
-                vals = (_fees_cache.get("low"),
-                        _fees_cache.get("med"),
-                        _fees_cache.get("high"))
-            for panel, v in zip(self._fee_panels, vals):
+            for panel, v in zip(self._fee_panels, self._fee_values()):
                 panel.set_value(v)
 
         def _build_single_tile(parent, key, width, right_pad):
@@ -1339,6 +1418,21 @@ class Tickoshi(tk.Tk):
         if not _ws_feed_is_live() or not isinstance(mb, (int, float)) or mb < 0:
             return "--"
         return f"{mb:,.0f}" if mb >= 100 else f"{mb:,.1f}"
+
+    def _fee_values(self):
+        """LOW/MED/HIGH for the fee tiles, blanked when the feed is not live."""
+        with _price_cache_lock:
+            if not _ws_feed_is_live():
+                return (None, None, None)
+            return (_fees_cache.get("low"),
+                    _fees_cache.get("med"),
+                    _fees_cache.get("high"))
+
+    def _refresh_ws_tiles(self):
+        """Repaint the WebSocket-fed tiles."""
+        for panel, v in zip(self._fee_panels, self._fee_values()):
+            panel.set_value(v)
+        self._update_secondary_panels()
 
     def _update_secondary_panels(self):
         if self._sats_panel is not None:
@@ -1434,19 +1528,7 @@ class Tickoshi(tk.Tk):
                 self._set_digits(display_str)
 
         # Secondary row updates (each runs only if its module is enabled).
-        if self._fee_panels:
-            # Fees only arrive over the WebSocket. If that feed has gone quiet,
-            # blank the tile rather than leave a stale estimate looking live.
-            with _price_cache_lock:
-                if _ws_feed_is_live():
-                    vals = (_fees_cache.get("low"),
-                            _fees_cache.get("med"),
-                            _fees_cache.get("high"))
-                else:
-                    vals = (None, None, None)
-            for panel, v in zip(self._fee_panels, vals):
-                panel.set_value(v)
-        self._update_secondary_panels()
+        self._refresh_ws_tiles()
 
     def _set_digits(self, display_str: str):
         digits = list(display_str[-self._num_digits:])
@@ -1458,6 +1540,8 @@ class Tickoshi(tk.Tk):
     # ── Fetch loop ─────────────────────────────────────────────────────────────
     def _start_result_poller(self):
         """Drain cross-thread results on the main Tk thread."""
+        self._ws_tick = 0
+
         def _poll():
             try:
                 while True:
@@ -1472,6 +1556,19 @@ class Tickoshi(tk.Tk):
                                    f"{type(e).__name__}: {e}")
             except queue.Empty:
                 pass
+
+            # Repaint the WebSocket tiles when a push changed something, and
+            # at least every ~5s so the staleness blanking takes effect too.
+            self._ws_tick += 1
+            if _ws_repaint.is_set() or self._ws_tick >= 100:
+                _ws_repaint.clear()
+                self._ws_tick = 0
+                try:
+                    self._refresh_ws_tiles()
+                except Exception as e:
+                    _debug_log(f"ws tile repaint failed: "
+                               f"{type(e).__name__}: {e}")
+
             if self.winfo_exists():
                 self.after(50, _poll)
         self.after(50, _poll)
@@ -1502,6 +1599,7 @@ class Tickoshi(tk.Tk):
             # this thread would stop the widget refreshing for the rest of the
             # session — which looks exactly like "the price stopped working".
             display = None
+            refreshed = False
             try:
                 refreshed = _fetch_all_prices(currency)
                 if needs_height:
@@ -1518,11 +1616,12 @@ class Tickoshi(tk.Tk):
                 _debug_log(f"fetch worker crashed: {type(e).__name__}: {e}")
             finally:
                 self._result_queue.put(
-                    lambda: self._on_fetch_done(display, currency, modules, gen))
+                    lambda: self._on_fetch_done(display, currency, modules,
+                                                gen, refreshed))
 
         threading.Thread(target=_worker, daemon=True).start()
 
-    def _on_fetch_done(self, display, currency, modules, gen):
+    def _on_fetch_done(self, display, currency, modules, gen, refreshed=True):
         # Stale worker (a newer _fetch_loop has superseded this one) — drop it
         # and in particular don't reschedule, or we'd end up with two timers.
         if gen != self._fetch_gen:
@@ -1540,7 +1639,19 @@ class Tickoshi(tk.Tk):
             # escaping this method used to cancel every future refresh.
             if gen == self._fetch_gen and self.winfo_exists():
                 self._fetch_after_id = self.after(
-                    self._refresh_s * 1000, self._fetch_loop)
+                    int(self._next_fetch_delay(refreshed) * 1000),
+                    self._fetch_loop)
+
+    def _next_fetch_delay(self, refreshed: bool) -> float:
+        """Seconds until the next fetch: the user's interval when the last one
+        worked, a short escalating retry when it came back empty."""
+        if refreshed:
+            self._fetch_retry_s = 0
+            return self._refresh_s
+        self._fetch_retry_s = min(
+            max(self._fetch_retry_s * 2, FETCH_RETRY_MIN_S), FETCH_RETRY_MAX_S)
+        # Never retry more slowly than the interval the user actually picked.
+        return min(self._fetch_retry_s, self._refresh_s)
 
     # ── Bindings ──────────────────────────────────────────────────────────────
     def _bind_children(self):
