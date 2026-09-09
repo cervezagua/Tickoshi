@@ -320,6 +320,34 @@ def _is_fresh(ts) -> bool:
 def _ws_feed_is_live() -> bool:
     return _is_fresh(_ws_alive_ts)
 
+# Substrings of a TLS handshake that was answered with something that is not
+# TLS. OpenSSL and Windows' schannel word it differently for the same event.
+_TLS_INTERCEPT_MARKERS = ("WRONG_VERSION_NUMBER", "UNEXPECTED_MESSAGE",
+                          "record layer", "INVALID_TOKEN", "unexpected eof")
+_tls_hint_logged = False
+
+def _note_if_intercepted(exc):
+    """Explain a handshake that got non-TLS bytes back, once per session.
+
+    Worth spelling out because the obvious suspect is wrong. A local firewall
+    denies the socket outright (WinError 10013 on Windows) and never reaches a
+    handshake; DNS interception shows up as an unexpected address. Getting a
+    malformed handshake back from the correct address means something in the
+    network path is matching on the hostname in the ClientHello, which no
+    setting in this app can route around.
+    """
+    global _tls_hint_logged
+    if _tls_hint_logged:
+        return
+    if not any(m in str(exc) for m in _TLS_INTERCEPT_MARKERS):
+        return
+    _tls_hint_logged = True
+    _debug_log("note: handshake answered with non-TLS bytes. If the dns lines "
+               "above look normal and other hosts work, this host is being "
+               "filtered by name in the network path — not by a local "
+               "firewall (that denies the socket instead). Needs a VPN, a "
+               "proxy, or a different network.")
+
 def _http_get(url, timeout=8, what=""):
     """GET `url`, returning `(body, status)`.
 
@@ -347,6 +375,7 @@ def _http_get(url, timeout=8, what=""):
         return None, e.code
     except Exception as e:
         _debug_log(f"http {what} failed: {type(e).__name__}: {e}")
+        _note_if_intercepted(e)
     return None, None
 
 def _prices_coingecko():
