@@ -31,7 +31,15 @@ Network I/O runs on background threads and hands results to the Tk main loop via
 - Hashrate: mempool.space mining REST endpoint (`_fetch_hashrate`).
 - Fees, mempool size, difficulty retarget and block height/age: one persistent WebSocket to `wss://mempool.space/api/v1/ws` via `websocket-client`. The socket pushes more than the app once read — `da` carries `difficultyChange`/`remainingBlocks` beside the hashrate, and `blocks` (an array on connect) plus `block` (one per new block) carry height and timestamp. Height from the socket lands the moment a block is mined; `_fetch_block_height` stays as the HTTP fallback and never rolls the height backwards. Lifecycle is managed by the module-level `_ws_start` / `_ws_stop` / `_ws_run` and the `_ws_on_*` callbacks. `_ws_run` takes a generation token so a run winding down from an earlier `_ws_stop()` retires instead of blocking a restart — checking only `is_alive()` there left the feed dead for the session when a tile was toggled off and straight back on. Reconnect backoff resets after a connection holds for `WS_STABLE_S`.
 
+One invariant holds the loop together, and both halves of it were bugs before: the queued result is what arms the next cycle, so `_worker` posts it from a `finally` and `_on_fetch_done` reschedules from a `finally`. Never make either conditional on success — the result poller swallows what is raised in the callback, so one exception used to stop the widget refreshing for the rest of the session with nothing in the log.
+
 When adding a new data source, follow the same pattern: fetch on a worker thread, push into the queue, render on the Tk tick.
+
+### Start at login
+`autostart_enabled()` / `set_autostart()` register the app for login: a `Run` registry value on Windows, a LaunchAgent plist on macOS, an autostart `.desktop` on Linux. The state is read back from the OS every time the menu opens rather than mirrored into our config, so an entry removed behind the app's back shows as off. `_launch_command()` returns the executable alone when frozen (PyInstaller sets `sys.frozen`) and interpreter-plus-script otherwise.
+
+### Price alert
+One-shot by design. `_arm_alert` captures the direction by comparing the target to the price on screen, so "alert me at 120k" means above when currently below and below when currently above — no direction picker. `_check_price_alert` runs on every price update, fires once (bell plus an amber border pulse, distinct from the green/red move flashes) and disarms, because a widget that beeps every refresh while the price sits past the line gets switched off. `parse_price_input` accepts grouping separators and a currency symbol, and is also what validates the value loaded from config, so a corrupt entry cannot break startup.
 
 ### Secondary tiles ("modules")
 Optional tiles are declared in the `MODULES` list (`key`, menu label). Enabled keys are stored in config as `modules`, rendered in the order the user toggled them on, and auto-paired two-per-row when both fit. Adding a tile means: append to `MODULES`, add a data fetch (or WS handler), and add a render branch in the layout code in `Tickoshi`.

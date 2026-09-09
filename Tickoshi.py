@@ -170,6 +170,102 @@ def config_path() -> str:
     os.makedirs(d, exist_ok=True)
     return os.path.join(d, "tickoshi_config.json")
 
+# ── Start at login ───────────────────────────────────────────────────────────
+# State lives where the OS keeps it — a registry value, a LaunchAgent plist, an
+# autostart .desktop — never mirrored into our own config, so the menu can
+# never disagree with what will actually happen at the next login.
+
+def _launch_command() -> list[str]:
+    """Argv that starts this app again.
+
+    A PyInstaller onefile build is its own executable; running from source
+    needs the interpreter plus the script. `sys.frozen` is what PyInstaller
+    sets, and is the only reliable way to tell the two apart.
+    """
+    if getattr(sys, "frozen", False):
+        return [os.path.abspath(sys.executable)]
+    return [os.path.abspath(sys.executable), os.path.abspath(__file__)]
+
+def _autostart_path() -> str:
+    if sys.platform == "darwin":
+        return os.path.join(os.path.expanduser("~"), "Library", "LaunchAgents",
+                            "com.tickoshi.app.plist")
+    base = os.environ.get("XDG_CONFIG_HOME",
+                          os.path.join(os.path.expanduser("~"), ".config"))
+    return os.path.join(base, "autostart", "tickoshi.desktop")
+
+_WIN_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+
+def autostart_enabled() -> bool:
+    try:
+        if os.name == "nt":
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _WIN_RUN_KEY) as k:
+                winreg.QueryValueEx(k, APP_NAME)
+            return True
+        return os.path.exists(_autostart_path())
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
+    except Exception as e:
+        _debug_log(f"autostart check failed: {type(e).__name__}: {e}")
+        return False
+
+def set_autostart(enable: bool) -> bool:
+    """Register or unregister the app for login. Returns the resulting state,
+    so a failure leaves the menu showing what is actually true."""
+    cmd = _launch_command()
+    try:
+        if os.name == "nt":
+            import winreg
+            with winreg.CreateKey(winreg.HKEY_CURRENT_USER, _WIN_RUN_KEY) as k:
+                if enable:
+                    # Quote every element: the path routinely contains spaces.
+                    winreg.SetValueEx(k, APP_NAME, 0, winreg.REG_SZ,
+                                      " ".join(f'"{c}"' for c in cmd))
+                else:
+                    try:
+                        winreg.DeleteValue(k, APP_NAME)
+                    except FileNotFoundError:
+                        pass
+        else:
+            path = _autostart_path()
+            if not enable:
+                try:
+                    os.remove(path)
+                except FileNotFoundError:
+                    pass
+            else:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                if sys.platform == "darwin":
+                    args = "".join(f"    <string>{c}</string>\n" for c in cmd)
+                    body = ('<?xml version="1.0" encoding="UTF-8"?>\n'
+                            '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+                            '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+                            '<plist version="1.0"><dict>\n'
+                            '  <key>Label</key><string>com.tickoshi.app</string>\n'
+                            '  <key>ProgramArguments</key><array>\n'
+                            f'{args}'
+                            '  </array>\n'
+                            '  <key>RunAtLoad</key><true/>\n'
+                            '</dict></plist>\n')
+                else:
+                    quoted = " ".join(
+                        c if " " not in c else f'"{c}"' for c in cmd)
+                    body = ("[Desktop Entry]\n"
+                            "Type=Application\n"
+                            f"Name={APP_NAME}\n"
+                            f"Exec={quoted}\n"
+                            "Terminal=false\n"
+                            "X-GNOME-Autostart-enabled=true\n")
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(body)
+    except Exception as e:
+        _debug_log(f"autostart {'enable' if enable else 'disable'} failed: "
+                   f"{type(e).__name__}: {e}")
+    return autostart_enabled()
+
 def _rr_pts(x1, y1, x2, y2, r):
     r = min(r, (x2-x1)//2, (y2-y1)//2)
     return [
@@ -305,6 +401,9 @@ _network_cache = {"hashrate_ehs": None, "mempool_mb": None,
                   "block_ts": None}
 # 24h price move per currency, keyed by CoinGecko id like _price_cache.
 _change_cache = {}
+# Dedup for HTTP value lines, same idea as _ws_logged: a 200-line log must not
+# be filled by values that repeat every cycle.
+_price_logged = {}
 _price_cache_lock = threading.Lock()
 
 def _fetch_all_prices(preferred: str | None = None):
@@ -334,6 +433,16 @@ def _fetch_all_prices(preferred: str | None = None):
                 chg = quotes.get(f"{gid}_24h_change")
                 if isinstance(chg, (int, float)):
                     _change_cache[gid] = float(chg)
+        if quotes and not _price_logged.get("fields"):
+            # One-shot: says whether include_24hr_change is actually being
+            # honoured, which is otherwise indistinguishable from a flat market.
+            _price_logged["fields"] = True
+            _debug_log(f"http price (coingecko) fields: {sorted(quotes)}")
+        if pref_gid:
+            chg_now = _change_cache.get(pref_gid)
+            if _price_logged.get("chg") != chg_now:
+                _price_logged["chg"] = chg_now
+                _debug_log(f"http price  24h change {pref_gid}={chg_now!r}")
         if not stored:
             # CoinGecko answers 200 with an empty or error-shaped body when it
             # is rate limiting. Counting the request itself as success skipped
@@ -405,6 +514,39 @@ def _fetch_block_height():
         return height
     except Exception:
         return _block_height_cache.get("height")
+
+def parse_price_input(text):
+    """Read a price a person typed. Accepts grouping separators and a currency
+    symbol, so "$ 120,000" and "120000" both work. Returns None if it is not a
+    usable positive number rather than raising at the caller."""
+    if text is None:
+        return None
+    cleaned = "".join(ch for ch in str(text) if ch.isdigit() or ch in ".,")
+    # Treat "," as grouping and "." as the decimal point. A lone comma used as
+    # a decimal separator ("1234,5") still parses because it is dropped.
+    cleaned = cleaned.replace(",", "")
+    if cleaned.count(".") > 1:
+        return None
+    try:
+        v = float(cleaned)
+    except (TypeError, ValueError):
+        return None
+    return v if v > 0 else None
+
+def _fmt_signed_pct(v):
+    """Signed percentage for the 24h and difficulty tiles.
+
+    Two decimals below 10% because a daily move of 0.4% and one of 0.44% are
+    different numbers, one above because the tile is narrow and nobody needs
+    hundredths of a 30% swing. Rounds away a signed zero: -0.04 formatted at
+    one decimal reads "-0.0", which looks like a bug.
+    """
+    if not isinstance(v, (int, float)):
+        return "--"
+    out = f"{v:+.2f}" if abs(v) < 10 else f"{v:+.1f}"
+    if float(out) == 0:
+        return "0.00" if abs(v) < 10 else "0.0"
+    return out
 
 def _fmt_fee(v):
     """Format a sat/vB number: fractional below 10, integer above.
@@ -993,6 +1135,11 @@ class Tickoshi(tk.Tk):
         self._border_color = self._cfg.get("border_color", "Gold")
         self._flash_enabled = self._cfg.get("flash", True)
         self._locked = self._cfg.get("locked", False)
+        # Price alert: a target and the direction it must be crossed from,
+        # captured when armed so a restart cannot silently flip the meaning.
+        self._alert_price = parse_price_input(self._cfg.get("alert_price"))
+        self._alert_above = bool(self._cfg.get("alert_above", True))
+        self._alert_win = None
         self._drag  = None
         self._last_price_str = None
         self._last_display_str = None
@@ -1097,6 +1244,8 @@ class Tickoshi(tk.Tk):
         self._cfg["border_color"] = self._border_color
         self._cfg["flash"]        = self._flash_enabled
         self._cfg["locked"]       = self._locked
+        self._cfg["alert_price"]  = self._alert_price
+        self._cfg["alert_above"]  = self._alert_above
         path = config_path()
         tmp = path + ".tmp"
         try:
@@ -1335,17 +1484,13 @@ class Tickoshi(tk.Tk):
         gecko_id = CURRENCY_TO_GECKO.get(self._currency, "usd")
         with _price_cache_lock:
             pct = _change_cache.get(gecko_id)
-        if not isinstance(pct, (int, float)):
-            return "--"
-        return f"{pct:+.1f}"
+        return _fmt_signed_pct(pct)
 
     def _compute_diff_str(self) -> str:
         """Projected change at the next retarget, signed."""
         with _price_cache_lock:
             pct = _network_cache.get("diff_change_pct")
-        if not isinstance(pct, (int, float)):
-            return "--"
-        return f"{pct:+.1f}"
+        return _fmt_signed_pct(pct)
 
     def _compute_blockage_str(self) -> str:
         """Time since the newest block. Recomputed every second from a stored
@@ -1445,18 +1590,23 @@ class Tickoshi(tk.Tk):
             for dp in self._digit_panels:
                 dp.set("-")
         else:
+            try:
+                new_val = int(display_str)
+            except ValueError:
+                new_val = None
+
             # Flash check (primary display is always price now)
-            if self._flash_enabled:
-                try:
-                    new_val = int(display_str)
-                    if self._prev_price is not None:
-                        if new_val > self._prev_price:
-                            self._pulse("#18c558")        # green = up
-                        elif new_val < self._prev_price:
-                            self._pulse("#e63b3b")        # red = down
-                    self._prev_price = new_val
-                except ValueError:
-                    pass
+            if new_val is not None and self._flash_enabled:
+                if self._prev_price is not None:
+                    if new_val > self._prev_price:
+                        self._pulse("#18c558")            # green = up
+                    elif new_val < self._prev_price:
+                        self._pulse("#e63b3b")            # red = down
+            if new_val is not None:
+                # Tracked regardless of the flash setting: the alert must not
+                # depend on an unrelated cosmetic toggle.
+                self._prev_price = new_val
+                self._check_price_alert(new_val)
 
             self._last_display_str = display_str
             needed = min(max(len(display_str), 1), MAX_DIGITS)
@@ -1495,8 +1645,12 @@ class Tickoshi(tk.Tk):
                     fn = self._result_queue.get_nowait()
                     try:
                         fn()
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        # Swallowed so one bad result can't kill the poller,
+                        # but never silently — this is where a render fault
+                        # would otherwise vanish without trace.
+                        _debug_log(f"result callback failed: "
+                                   f"{type(e).__name__}: {e}")
             except queue.Empty:
                 pass
             if self.winfo_exists():
@@ -1550,20 +1704,29 @@ class Tickoshi(tk.Tk):
         needs_height = ("height" in modules) or ("halving" in modules)
 
         def _worker():
-            refreshed = _fetch_all_prices(currency)
-            if needs_height:
-                _fetch_block_height()
-            if "hash" in modules:
-                _fetch_hashrate()
-            # Fees + mempool are pushed via WebSocket — no HTTP fetch needed.
-            display = fetch_price(currency)
-            if not refreshed:
-                _debug_log(f"fetch cycle: no live {currency} price from any "
-                           f"source (showing "
-                           f"{'last known' if display else 'nothing'})")
-            self._result_queue.put(
-                lambda: self._on_fetch_done(display, currency, modules, gen,
-                                            refreshed))
+            # The queued callback is what schedules the next cycle, so it must
+            # be posted no matter what happens above it. An exception escaping
+            # this thread would stop the widget refreshing for the rest of the
+            # session — which looks exactly like "the price stopped working".
+            display, refreshed = None, False
+            try:
+                refreshed = _fetch_all_prices(currency)
+                if needs_height:
+                    _fetch_block_height()
+                if "hash" in modules:
+                    _fetch_hashrate()
+                # Fees + mempool arrive over the WebSocket — no fetch here.
+                display = fetch_price(currency)
+                if not refreshed:
+                    _debug_log(f"fetch cycle: no live {currency} price from any "
+                               f"source (showing "
+                               f"{'last known' if display else 'nothing'})")
+            except Exception as e:
+                _debug_log(f"fetch worker crashed: {type(e).__name__}: {e}")
+            finally:
+                self._result_queue.put(
+                    lambda: self._on_fetch_done(display, currency, modules,
+                                                gen, refreshed))
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -1572,14 +1735,21 @@ class Tickoshi(tk.Tk):
         # and in particular don't reschedule, or we'd end up with two timers.
         if gen != self._fetch_gen:
             return
-        # Discard stale results from before a currency/module change.
-        if currency != self._currency or modules != frozenset(self._modules):
-            return
-        self._last_price_str = display
-        self._update_display(display)
-        if self.winfo_exists():
-            self._fetch_after_id = self.after(
-                int(self._next_fetch_delay(refreshed) * 1000), self._fetch_loop)
+        try:
+            # Discard stale results from before a currency/module change; that
+            # change restarts the loop itself, so this cycle just stops here.
+            if (currency == self._currency
+                    and modules == frozenset(self._modules)):
+                self._last_price_str = display
+                self._update_display(display)
+        finally:
+            # Rescheduling has to survive a render error. The result poller
+            # swallows whatever is raised in here, so a single Tcl error
+            # escaping this method used to cancel every future refresh.
+            if gen == self._fetch_gen and self.winfo_exists():
+                self._fetch_after_id = self.after(
+                    int(self._next_fetch_delay(refreshed) * 1000),
+                    self._fetch_loop)
 
     def _next_fetch_delay(self, refreshed: bool) -> float:
         """Seconds until the next fetch: the user's interval when the last one
@@ -1719,6 +1889,19 @@ class Tickoshi(tk.Tk):
         menu.add_command(label=f"  Lock{lock_check}",
                          command=self._menu_toggle_lock)
 
+        # Read the OS every time the menu opens rather than trusting a stored
+        # flag, so an entry removed behind our back shows as off.
+        if self._alert_price is not None:
+            arrow = "\u25b2" if self._alert_above else "\u25bc"
+            alert_label = f"  Price alert: {self._alert_price:,.0f} {arrow}"
+        else:
+            alert_label = "  Price alert\u2026"
+        menu.add_command(label=alert_label, command=self._menu_price_alert)
+
+        auto_check = " \u2713" if autostart_enabled() else ""
+        menu.add_command(label=f"  Start at login{auto_check}",
+                         command=self._menu_toggle_autostart)
+
         menu.add_separator()
         menu.add_command(label="  Close", command=self._menu_quit)
 
@@ -1816,6 +1999,122 @@ class Tickoshi(tk.Tk):
     def _menu_toggle_flash(self):
         self._flash_enabled = not self._flash_enabled
         self._save_config()
+
+    # ── Price alert ───────────────────────────────────────────────────────────
+    def _arm_alert(self, target):
+        """Arm at `target`. The direction is decided here, against the price on
+        screen, so "alert me at 120k" means above when we are below it and
+        below when we are above it — no direction picker needed."""
+        current = None
+        try:
+            current = int(self._last_display_str) if self._last_display_str else None
+        except (TypeError, ValueError):
+            current = None
+        self._alert_price = target
+        self._alert_above = (current is None) or (target >= current)
+        self._save_config()
+        _debug_log(f"price alert armed at {target:,.0f} "
+                   f"({'rise above' if self._alert_above else 'fall below'}; "
+                   f"now {current if current is not None else '?'})")
+
+    def _clear_alert(self):
+        if self._alert_price is None:
+            return
+        _debug_log("price alert cleared")
+        self._alert_price = None
+        self._save_config()
+
+    def _check_price_alert(self, value):
+        """Fire once when the target is crossed, then disarm.
+
+        One-shot on purpose: a widget that beeps every refresh while the price
+        sits above the line would be turned off within a minute.
+        """
+        target = self._alert_price
+        if target is None or not isinstance(value, (int, float)):
+            return
+        hit = value >= target if self._alert_above else value <= target
+        if not hit:
+            return
+        self._alert_price = None
+        self._save_config()
+        _debug_log(f"price alert FIRED: {value:,} "
+                   f"{'>=' if self._alert_above else '<='} {target:,.0f}")
+        try:
+            self.bell()
+        except Exception:
+            pass
+        self._pulse("#ffd24a")      # amber — distinct from the up/down flashes
+
+    def _menu_price_alert(self):
+        self.after(30, self._open_alert_dialog)
+
+    def _open_alert_dialog(self):
+        if self._alert_win is not None and self._alert_win.winfo_exists():
+            self._alert_win.lift()
+            return
+        win = tk.Toplevel(self)
+        self._alert_win = win
+        win.title(f"{APP_NAME} — price alert")
+        win.configure(bg=C_FACE)
+        win.resizable(False, False)
+        win.transient(self)
+
+        sign = CURRENCY_SIGNS.get(self._currency, "$")
+        tk.Label(win, text=f"Alert when BTC reaches ({sign})",
+                 bg=C_FACE, fg=C_LABEL_TXT,
+                 font=(_FONT_FAMILY, 10)).pack(padx=14, pady=(12, 4))
+
+        entry = tk.Entry(win, width=16, justify="center",
+                         bg=C_PANEL_BG, fg=C_DIGIT, insertbackground=C_DIGIT,
+                         relief="flat", font=(_FONT_FAMILY, 14, "bold"))
+        entry.pack(padx=14)
+        if self._alert_price is not None:
+            entry.insert(0, f"{self._alert_price:,.0f}")
+        elif self._last_display_str:
+            entry.insert(0, self._last_display_str)
+        entry.select_range(0, "end")
+        entry.focus_set()
+
+        note = tk.Label(win, text="", bg=C_FACE, fg="#e63b3b",
+                        font=(_FONT_FAMILY, 9))
+        note.pack(padx=14, pady=(4, 0))
+
+        def do_set(_e=None):
+            target = parse_price_input(entry.get())
+            if target is None:
+                note.config(text="Enter a number above zero")
+                return
+            self._arm_alert(target)
+            close()
+
+        def do_clear():
+            self._clear_alert()
+            close()
+
+        def close(_e=None):
+            self._alert_win = None
+            win.destroy()
+
+        row = tk.Frame(win, bg=C_FACE)
+        row.pack(padx=14, pady=12)
+        for label, cmd in (("Set", do_set), ("Clear", do_clear),
+                           ("Cancel", close)):
+            tk.Button(row, text=label, command=cmd, relief="flat", bd=0,
+                      bg=C_PANEL_BG, fg=C_LABEL_TXT,
+                      activebackground=self._bc("hi"), activeforeground=C_FACE,
+                      font=(_FONT_FAMILY, 9, "bold"), width=7).pack(side="left",
+                                                                    padx=3)
+        win.bind("<Return>", do_set)
+        win.bind("<Escape>", close)
+        win.protocol("WM_DELETE_WINDOW", close)
+
+    def _menu_toggle_autostart(self):
+        want = not autostart_enabled()
+        got = set_autostart(want)
+        _debug_log(f"autostart {'enabled' if got else 'disabled'}"
+                   + ("" if got == want else "  (requested "
+                      f"{'enable' if want else 'disable'}, and it did not take)"))
 
     def _menu_toggle_lock(self):
         self._locked = not self._locked
