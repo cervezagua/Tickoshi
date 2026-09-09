@@ -51,6 +51,14 @@ REFRESH_OPTIONS = [
     ("1 hr",    3600),
 ]
 
+# A refresh interval is how often to poll when polling WORKS. A cycle that
+# fetched nothing has to come back sooner than that, or a single failure —
+# a rate limit, or sockets briefly unavailable while the OS clears a freshly
+# launched binary — leaves the price blank for the whole interval, up to an
+# hour on the 60-minute setting.
+FETCH_RETRY_MIN_S = 5
+FETCH_RETRY_MAX_S = 60
+
 DRUM_STEPS = 12
 DRUM_MS    = 14
 
@@ -58,13 +66,17 @@ DRUM_MS    = 14
 SIZES = {"Small": 0.7, "Medium": 1.0, "Large": 1.4}
 
 # Currencies: code → (Binance symbol, CoinGecko id)
+# code → (Binance symbol or None, CoinGecko id). None means Binance has no
+# such spot pair, so there is nothing to ask it for: BTC/GBP was delisted
+# 2023-12-29 and BTC/RUB on 2024-01-30 with the Russia exit. Requesting either
+# returns 400 {"code":-1121,"msg":"Invalid symbol."} every single time.
 CURRENCIES = [
     ("USD", "BTCUSDT", "usd"),
     ("TRY", "BTCTRY",  "try"),
     ("EUR", "BTCEUR",  "eur"),
-    ("GBP", "BTCGBP",  "gbp"),
+    ("GBP", None,      "gbp"),
     ("JPY", "BTCJPY",  "jpy"),
-    ("RUB", "BTCRUB",  "rub"),
+    ("RUB", None,      "rub"),
 ]
 CURRENCY_TO_GECKO = {code: gid for code, _, gid in CURRENCIES}
 
@@ -99,7 +111,7 @@ BORDER_COLORS = {
 }
 
 # Next Bitcoin halving block
-NEXT_HALVING_BLOCK = 1_050_000
+HALVING_INTERVAL = 210_000
 
 # Border pulse animation (price up/down flash)
 PULSE_MS         = 30     # ms per animation step
@@ -295,9 +307,14 @@ _network_cache = {"hashrate_ehs": None, "mempool_mb": None,
 _change_cache = {}
 _price_cache_lock = threading.Lock()
 
-def _fetch_all_prices():
+def _fetch_all_prices(preferred: str | None = None):
+    """Refresh the price cache. Returns True if *this call* obtained a live
+    quote for `preferred`; the cache keeps the last good price, so asking
+    whether it is non-empty would report success long after the network went
+    away."""
     gecko_ids = ",".join(gid for _, _, gid in CURRENCIES)
-    primary_ok = False
+    pref_gid = CURRENCY_TO_GECKO.get(preferred)
+    stored = set()
     try:
         # include_24hr_change rides along on the existing request — the 24h
         # move costs no extra call, and Binance has no equivalent here, so the
@@ -307,33 +324,57 @@ def _fetch_all_prices():
         req = urllib.request.Request(url, headers={"User-Agent": "Tickoshi/1.0"})
         with urllib.request.urlopen(req, timeout=8) as r:
             data = json.loads(r.read().decode())
-        quotes = data.get("bitcoin", {})
+        quotes = data.get("bitcoin") or {}
         with _price_cache_lock:
             for _, _, gid in CURRENCIES:
-                if gid in quotes:
-                    _price_cache[gid] = float(quotes[gid])
+                v = quotes.get(gid)
+                if isinstance(v, (int, float)) and v > 0:
+                    _price_cache[gid] = float(v)
+                    stored.add(gid)
                 chg = quotes.get(f"{gid}_24h_change")
                 if isinstance(chg, (int, float)):
                     _change_cache[gid] = float(chg)
-        primary_ok = True
+        if not stored:
+            # CoinGecko answers 200 with an empty or error-shaped body when it
+            # is rate limiting. Counting the request itself as success skipped
+            # the fallback below and left the price blank until the next
+            # restart, so a usable quote is what counts as success.
+            _debug_log(f"http price (coingecko) returned no usable quotes: "
+                       f"{str(quotes)[:120]}")
     except Exception as e:
         _debug_log(f"http price fetch failed (coingecko): {type(e).__name__}: {e}")
 
-    # Binance fallback when CoinGecko is unreachable.
-    if not primary_ok:
-        for code, bsym, gid in CURRENCIES:
+    def got_wanted():
+        # A response carrying every currency but the one on screen still
+        # leaves the display blank, so success keys off the wanted quote.
+        return (pref_gid in stored) if pref_gid else bool(stored)
+
+    if not got_wanted():
+        # Only the selected currency is ever displayed and switching currency
+        # kicks off a fresh fetch, so stop at the first symbol that works
+        # rather than walking them all at 5s a piece while the network is down.
+        order = [c for c in CURRENCIES if c[0] == preferred]
+        order += [c for c in CURRENCIES if c not in order]
+        for code, bsym, gid in order:
+            if bsym is None:            # no such pair — nothing to ask for
+                continue
             try:
                 url = "https://api.binance.com/api/v3/ticker/price?symbol=" + bsym
                 req = urllib.request.Request(url, headers={"User-Agent": "Tickoshi/1.0"})
                 with urllib.request.urlopen(req, timeout=5) as r:
                     data = json.loads(r.read().decode())
-                with _price_cache_lock:
-                    _price_cache[gid] = float(data["price"])
+                price = float(data["price"])
             except Exception as e:
                 _debug_log(f"http price fetch failed (binance {bsym}): {type(e).__name__}: {e}")
                 continue
+            if price > 0:
+                with _price_cache_lock:
+                    _price_cache[gid] = price
+                stored.add(gid)
+                if preferred is None or code == preferred:
+                    break
 
-    return bool(_price_cache)
+    return got_wanted()
 
 def _fetch_hashrate():
     """Populate _network_cache['hashrate_ehs'] from mempool.space's free
@@ -409,10 +450,20 @@ _ws_thread = None
 _ws_stop_flag = threading.Event()
 _ws_app = None  # active WebSocketApp instance (for .close())
 _ws_keys_logged = False  # one-shot top-level-key dump per connection
+_ws_lock = threading.Lock()
+_ws_gen = 0          # identity of the run allowed to own the socket
+_ws_running = False  # a run at the current generation is serving
+_ws_logged = {}      # last logged value per feed, to keep the log from churning
+
+WS_URL           = "wss://mempool.space/api/v1/ws"
+WS_BACKOFF_MIN_S = 5
+WS_BACKOFF_MAX_S = 60
+WS_STABLE_S      = 60   # a connection up this long earns a fresh backoff
 
 def _ws_on_open(ws):
     global _ws_keys_logged
     _ws_keys_logged = False
+    _ws_logged.clear()
     _debug_log("ws CONNECTED")
     try:
         ws.send(json.dumps({"action": "init"}))
@@ -444,12 +495,17 @@ def _ws_on_message(ws, raw):
             _fees_cache["high"] = _fmt_fee(high)
             _fees_cache["med"]  = _fmt_fee(med)
             _fees_cache["low"]  = _fmt_fee(low)
-        _debug_log(
-            f"ws fees  raw=(fastest={high!r}, halfHour={med!r}, hour={low!r}, "
-            f"economy={fees.get('economyFee')!r}, minimum={fees.get('minimumFee')!r})  "
-            f"formatted=(HIGH={_fees_cache['high']!r}, MED={_fees_cache['med']!r}, "
-            f"LOW={_fees_cache['low']!r})"
-        )
+        shown = (_fees_cache["high"], _fees_cache["med"], _fees_cache["low"])
+        # mempool.space re-pushes fees every few seconds. Logging every push
+        # filled the whole 200-line window in about two minutes and scrolled
+        # every connection error out of it, so only a change earns a line.
+        if _ws_logged.get("fees") != shown:
+            _ws_logged["fees"] = shown
+            _debug_log(
+                f"ws fees  raw=(fastest={high!r}, halfHour={med!r}, hour={low!r}, "
+                f"economy={fees.get('economyFee')!r}, minimum={fees.get('minimumFee')!r})  "
+                f"formatted=(HIGH={shown[0]!r}, MED={shown[1]!r}, LOW={shown[2]!r})"
+            )
 
     # Mempool size — {"mempoolInfo": {"bytes": <vBytes>, "size": <tx_count>, ...}}
     mi = msg.get("mempoolInfo")
@@ -458,7 +514,10 @@ def _ws_on_message(ws, raw):
         if isinstance(vbytes, (int, float)) and vbytes >= 0:
             with _price_cache_lock:
                 _network_cache["mempool_mb"] = vbytes / 1_000_000.0
-            _debug_log(f"ws mempool  bytes={vbytes} -> {_network_cache['mempool_mb']:.2f} MB")
+            mb = _network_cache["mempool_mb"]
+            if _ws_logged.get("mempool") != round(mb, 2):
+                _ws_logged["mempool"] = round(mb, 2)
+                _debug_log(f"ws mempool  bytes={vbytes} -> {mb:.2f} MB")
 
     # Difficulty adjustment — {"da": {"currentHashrate", "difficultyChange",
     # "remainingBlocks", ...}}. The hashrate tile already parsed this object;
@@ -469,7 +528,10 @@ def _ws_on_message(ws, raw):
         if isinstance(hr, (int, float)) and hr > 0:
             with _price_cache_lock:
                 _network_cache["hashrate_ehs"] = hr / 1e18
-            _debug_log(f"ws hashrate  H/s={hr} -> {_network_cache['hashrate_ehs']:.2f} EH/s")
+            ehs = _network_cache["hashrate_ehs"]
+            if _ws_logged.get("hashrate") != round(ehs, 2):
+                _ws_logged["hashrate"] = round(ehs, 2)
+                _debug_log(f"ws hashrate  H/s={hr} -> {ehs:.2f} EH/s")
         chg  = da.get("difficultyChange")
         left = da.get("remainingBlocks")
         with _price_cache_lock:
@@ -522,40 +584,80 @@ def _ws_on_error(ws, err):
 def _ws_on_close(ws, code, reason):
     _debug_log(f"ws CLOSED code={code!r} reason={reason!r}")
 
-def _ws_run():
-    global _ws_app
-    backoff = 5
-    while not _ws_stop_flag.is_set():
+def _ws_run(gen):
+    """Connect-and-reconnect loop for one generation of the feed.
+
+    `gen` is this run's claim on the socket: _ws_start/_ws_stop bump the global
+    generation, so a run left over from an earlier stop retires at its next
+    check instead of lingering or fighting over _ws_app.
+    """
+    global _ws_app, _ws_running
+    backoff = WS_BACKOFF_MIN_S
+    while True:
+        with _ws_lock:
+            if gen != _ws_gen or _ws_stop_flag.is_set():
+                break
+        started = time.monotonic()
         try:
-            _ws_app = websocket.WebSocketApp(
-                "wss://mempool.space/api/v1/ws",
+            app = websocket.WebSocketApp(
+                WS_URL,
                 on_open    = _ws_on_open,
                 on_message = _ws_on_message,
                 on_error   = _ws_on_error,
                 on_close   = _ws_on_close,
             )
-            _ws_app.run_forever(ping_interval=25, ping_timeout=10)
+            with _ws_lock:
+                if gen != _ws_gen:
+                    break
+                _ws_app = app
+            app.run_forever(ping_interval=25, ping_timeout=10)
         except Exception as e:
             _debug_log(f"ws run_forever crash: {type(e).__name__}: {e}")
-        if _ws_stop_flag.is_set():
-            break
-        _debug_log(f"ws disconnected; retry in {backoff}s")
+        up = time.monotonic() - started
+        with _ws_lock:
+            if gen != _ws_gen or _ws_stop_flag.is_set():
+                break
+        # A connection that stayed up is evidence the network is healthy, so
+        # the next drop retries promptly. Without this the backoff only ever
+        # grew, and a few suspend/resume cycles left every later reconnect
+        # waiting the full minute for the rest of the session.
+        if up >= WS_STABLE_S:
+            backoff = WS_BACKOFF_MIN_S
+        _debug_log(f"ws disconnected after {up:.0f}s; retry in {backoff}s")
         _ws_stop_flag.wait(backoff)
-        backoff = min(backoff * 2, 60)
+        backoff = min(backoff * 2, WS_BACKOFF_MAX_S)
+
+    with _ws_lock:
+        if gen == _ws_gen:
+            _ws_running = False
+            _ws_app = None
 
 def _ws_start():
-    global _ws_thread
-    if _ws_thread is not None and _ws_thread.is_alive():
-        return
-    _ws_stop_flag.clear()
-    _ws_thread = threading.Thread(target=_ws_run, daemon=True)
-    _ws_thread.start()
+    global _ws_thread, _ws_gen, _ws_running
+    with _ws_lock:
+        _ws_stop_flag.clear()
+        if _ws_running and _ws_thread is not None and _ws_thread.is_alive():
+            return
+        # Retire any run still winding down from a previous _ws_stop(). The old
+        # is_alive() check alone let a stop-then-start — toggling a WS tile off
+        # and straight back on — return early against a thread that was about
+        # to exit, leaving the feed dead until the app restarted.
+        _ws_gen += 1
+        gen = _ws_gen
+        _ws_running = True
+        _ws_thread = threading.Thread(target=_ws_run, args=(gen,), daemon=True)
+        _ws_thread.start()
 
 def _ws_stop():
-    _ws_stop_flag.set()
-    if _ws_app is not None:
+    global _ws_gen, _ws_running, _ws_app
+    with _ws_lock:
+        _ws_gen += 1
+        _ws_running = False
+        _ws_stop_flag.set()
+        app, _ws_app = _ws_app, None
+    if app is not None:
         try:
-            _ws_app.close()
+            app.close()
         except Exception:
             pass
 
@@ -567,10 +669,16 @@ def fetch_price(currency: str = "USD") -> str | None:
         return str(int(round(price)))
     return None
 
+def next_halving_block(height: int) -> int:
+    """The next halving at or after `height`. Derived rather than hardcoded: a
+    fixed constant silently turns the tile into "--" forever once that block is
+    mined, in every binary already shipped."""
+    return (height // HALVING_INTERVAL + 1) * HALVING_INTERVAL
+
 def calc_halving_days(height: int) -> int | None:
-    if height is None or height >= NEXT_HALVING_BLOCK:
+    if not isinstance(height, int) or height < 0:
         return None
-    blocks_remaining = NEXT_HALVING_BLOCK - height
+    blocks_remaining = next_halving_block(height) - height
     minutes_remaining = blocks_remaining * 10
     return int(minutes_remaining / 60 / 24)
 
@@ -896,6 +1004,7 @@ class Tickoshi(tk.Tk):
         self._result_queue = queue.Queue()
         self._fetch_after_id = None    # pending fetch-loop timer
         self._fetch_gen = 0            # latest fetch generation; stale workers no-op
+        self._fetch_retry_s = 0        # backoff after a cycle that got nothing
 
         # Frameless, always-on-top
         if sys.platform.startswith("linux"):
@@ -1441,19 +1550,24 @@ class Tickoshi(tk.Tk):
         needs_height = ("height" in modules) or ("halving" in modules)
 
         def _worker():
-            _fetch_all_prices()
+            refreshed = _fetch_all_prices(currency)
             if needs_height:
                 _fetch_block_height()
             if "hash" in modules:
                 _fetch_hashrate()
             # Fees + mempool are pushed via WebSocket — no HTTP fetch needed.
             display = fetch_price(currency)
+            if not refreshed:
+                _debug_log(f"fetch cycle: no live {currency} price from any "
+                           f"source (showing "
+                           f"{'last known' if display else 'nothing'})")
             self._result_queue.put(
-                lambda: self._on_fetch_done(display, currency, modules, gen))
+                lambda: self._on_fetch_done(display, currency, modules, gen,
+                                            refreshed))
 
         threading.Thread(target=_worker, daemon=True).start()
 
-    def _on_fetch_done(self, display, currency, modules, gen):
+    def _on_fetch_done(self, display, currency, modules, gen, refreshed=True):
         # Stale worker (a newer _fetch_loop has superseded this one) — drop it
         # and in particular don't reschedule, or we'd end up with two timers.
         if gen != self._fetch_gen:
@@ -1465,7 +1579,18 @@ class Tickoshi(tk.Tk):
         self._update_display(display)
         if self.winfo_exists():
             self._fetch_after_id = self.after(
-                self._refresh_s * 1000, self._fetch_loop)
+                int(self._next_fetch_delay(refreshed) * 1000), self._fetch_loop)
+
+    def _next_fetch_delay(self, refreshed: bool) -> float:
+        """Seconds until the next fetch: the user's interval when the last one
+        worked, a short escalating retry when it came back empty."""
+        if refreshed:
+            self._fetch_retry_s = 0
+            return self._refresh_s
+        self._fetch_retry_s = min(
+            max(self._fetch_retry_s * 2, FETCH_RETRY_MIN_S), FETCH_RETRY_MAX_S)
+        # Never retry more slowly than the interval the user actually picked.
+        return min(self._fetch_retry_s, self._refresh_s)
 
     # ── Bindings ──────────────────────────────────────────────────────────────
     def _bind_children(self):
