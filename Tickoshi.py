@@ -51,6 +51,14 @@ REFRESH_OPTIONS = [
     ("1 hr",    3600),
 ]
 
+# A refresh interval is how often to poll when polling WORKS. A cycle that
+# fetched nothing has to come back sooner than that, or a single failure —
+# a rate limit, or sockets briefly unavailable while the OS clears a freshly
+# launched binary — leaves the price blank for the whole interval, up to an
+# hour on the 60-minute setting.
+FETCH_RETRY_MIN_S = 5
+FETCH_RETRY_MAX_S = 60
+
 DRUM_STEPS = 12
 DRUM_MS    = 14
 
@@ -58,13 +66,17 @@ DRUM_MS    = 14
 SIZES = {"Small": 0.7, "Medium": 1.0, "Large": 1.4}
 
 # Currencies: code → (Binance symbol, CoinGecko id)
+# code → (Binance symbol or None, CoinGecko id). None means Binance has no
+# such spot pair, so there is nothing to ask it for: BTC/GBP was delisted
+# 2023-12-29 and BTC/RUB on 2024-01-30 with the Russia exit. Requesting either
+# returns 400 {"code":-1121,"msg":"Invalid symbol."} every single time.
 CURRENCIES = [
     ("USD", "BTCUSDT", "usd"),
     ("TRY", "BTCTRY",  "try"),
     ("EUR", "BTCEUR",  "eur"),
-    ("GBP", "BTCGBP",  "gbp"),
+    ("GBP", None,      "gbp"),
     ("JPY", "BTCJPY",  "jpy"),
-    ("RUB", "BTCRUB",  "rub"),
+    ("RUB", None,      "rub"),
 ]
 CURRENCY_TO_GECKO = {code: gid for code, _, gid in CURRENCIES}
 
@@ -76,12 +88,15 @@ CURRENCY_SIGNS = {
 
 # Secondary-row modules (key, menu label). Primary row always shows Price.
 MODULES = [
-    ("fees",    "Fees"),
-    ("sats",    "Sats"),
-    ("height",  "Block Height"),
-    ("halving", "Halving"),
-    ("hash",    "Hashrate"),
-    ("mempool", "Mempool"),
+    ("fees",     "Fees"),
+    ("sats",     "Sats"),
+    ("change",   "24h Change"),
+    ("height",   "Block Height"),
+    ("blockage", "Block Age"),
+    ("halving",  "Halving"),
+    ("diff",     "Difficulty"),
+    ("hash",     "Hashrate"),
+    ("mempool",  "Mempool"),
 ]
 MODULE_KEYS = {k for k, _ in MODULES}
 
@@ -96,7 +111,7 @@ BORDER_COLORS = {
 }
 
 # Next Bitcoin halving block
-NEXT_HALVING_BLOCK = 1_050_000
+HALVING_INTERVAL = 210_000
 
 # Border pulse animation (price up/down flash)
 PULSE_MS         = 30     # ms per animation step
@@ -154,6 +169,102 @@ def config_path() -> str:
     d = os.path.join(base, APP_NAME)
     os.makedirs(d, exist_ok=True)
     return os.path.join(d, "tickoshi_config.json")
+
+# ── Start at login ───────────────────────────────────────────────────────────
+# State lives where the OS keeps it — a registry value, a LaunchAgent plist, an
+# autostart .desktop — never mirrored into our own config, so the menu can
+# never disagree with what will actually happen at the next login.
+
+def _launch_command() -> list[str]:
+    """Argv that starts this app again.
+
+    A PyInstaller onefile build is its own executable; running from source
+    needs the interpreter plus the script. `sys.frozen` is what PyInstaller
+    sets, and is the only reliable way to tell the two apart.
+    """
+    if getattr(sys, "frozen", False):
+        return [os.path.abspath(sys.executable)]
+    return [os.path.abspath(sys.executable), os.path.abspath(__file__)]
+
+def _autostart_path() -> str:
+    if sys.platform == "darwin":
+        return os.path.join(os.path.expanduser("~"), "Library", "LaunchAgents",
+                            "com.tickoshi.app.plist")
+    base = os.environ.get("XDG_CONFIG_HOME",
+                          os.path.join(os.path.expanduser("~"), ".config"))
+    return os.path.join(base, "autostart", "tickoshi.desktop")
+
+_WIN_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+
+def autostart_enabled() -> bool:
+    try:
+        if os.name == "nt":
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _WIN_RUN_KEY) as k:
+                winreg.QueryValueEx(k, APP_NAME)
+            return True
+        return os.path.exists(_autostart_path())
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
+    except Exception as e:
+        _debug_log(f"autostart check failed: {type(e).__name__}: {e}")
+        return False
+
+def set_autostart(enable: bool) -> bool:
+    """Register or unregister the app for login. Returns the resulting state,
+    so a failure leaves the menu showing what is actually true."""
+    cmd = _launch_command()
+    try:
+        if os.name == "nt":
+            import winreg
+            with winreg.CreateKey(winreg.HKEY_CURRENT_USER, _WIN_RUN_KEY) as k:
+                if enable:
+                    # Quote every element: the path routinely contains spaces.
+                    winreg.SetValueEx(k, APP_NAME, 0, winreg.REG_SZ,
+                                      " ".join(f'"{c}"' for c in cmd))
+                else:
+                    try:
+                        winreg.DeleteValue(k, APP_NAME)
+                    except FileNotFoundError:
+                        pass
+        else:
+            path = _autostart_path()
+            if not enable:
+                try:
+                    os.remove(path)
+                except FileNotFoundError:
+                    pass
+            else:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                if sys.platform == "darwin":
+                    args = "".join(f"    <string>{c}</string>\n" for c in cmd)
+                    body = ('<?xml version="1.0" encoding="UTF-8"?>\n'
+                            '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+                            '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+                            '<plist version="1.0"><dict>\n'
+                            '  <key>Label</key><string>com.tickoshi.app</string>\n'
+                            '  <key>ProgramArguments</key><array>\n'
+                            f'{args}'
+                            '  </array>\n'
+                            '  <key>RunAtLoad</key><true/>\n'
+                            '</dict></plist>\n')
+                else:
+                    quoted = " ".join(
+                        c if " " not in c else f'"{c}"' for c in cmd)
+                    body = ("[Desktop Entry]\n"
+                            "Type=Application\n"
+                            f"Name={APP_NAME}\n"
+                            f"Exec={quoted}\n"
+                            "Terminal=false\n"
+                            "X-GNOME-Autostart-enabled=true\n")
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(body)
+    except Exception as e:
+        _debug_log(f"autostart {'enable' if enable else 'disable'} failed: "
+                   f"{type(e).__name__}: {e}")
+    return autostart_enabled()
 
 def _rr_pts(x1, y1, x2, y2, r):
     r = min(r, (x2-x1)//2, (y2-y1)//2)
@@ -283,40 +394,96 @@ class FlipCard(tk.Frame):
 _price_cache = {}
 _block_height_cache = {"height": None}
 _fees_cache = {"low": None, "med": None, "high": None}
-_network_cache = {"hashrate_ehs": None, "mempool_mb": None}
+_network_cache = {"hashrate_ehs": None, "mempool_mb": None,
+                  # Difficulty retarget, from the WS "da" object.
+                  "diff_change_pct": None, "diff_blocks_left": None,
+                  # Newest block seen, for the block-age counter.
+                  "block_ts": None}
+# 24h price move per currency, keyed by CoinGecko id like _price_cache.
+_change_cache = {}
+# Dedup for HTTP value lines, same idea as _ws_logged: a 200-line log must not
+# be filled by values that repeat every cycle.
+_price_logged = {}
 _price_cache_lock = threading.Lock()
 
-def _fetch_all_prices():
+def _fetch_all_prices(preferred: str | None = None):
+    """Refresh the price cache. Returns True if *this call* obtained a live
+    quote for `preferred`; the cache keeps the last good price, so asking
+    whether it is non-empty would report success long after the network went
+    away."""
     gecko_ids = ",".join(gid for _, _, gid in CURRENCIES)
-    primary_ok = False
+    pref_gid = CURRENCY_TO_GECKO.get(preferred)
+    stored = set()
     try:
-        url = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=" + gecko_ids
+        # include_24hr_change rides along on the existing request — the 24h
+        # move costs no extra call, and Binance has no equivalent here, so the
+        # tile falls back to "--" whenever the fallback supplied the price.
+        url = ("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin"
+               "&include_24hr_change=true&vs_currencies=" + gecko_ids)
         req = urllib.request.Request(url, headers={"User-Agent": "Tickoshi/1.0"})
         with urllib.request.urlopen(req, timeout=8) as r:
             data = json.loads(r.read().decode())
+        quotes = data.get("bitcoin") or {}
         with _price_cache_lock:
             for _, _, gid in CURRENCIES:
-                if gid in data.get("bitcoin", {}):
-                    _price_cache[gid] = float(data["bitcoin"][gid])
-        primary_ok = True
+                v = quotes.get(gid)
+                if isinstance(v, (int, float)) and v > 0:
+                    _price_cache[gid] = float(v)
+                    stored.add(gid)
+                chg = quotes.get(f"{gid}_24h_change")
+                if isinstance(chg, (int, float)):
+                    _change_cache[gid] = float(chg)
+        if quotes and not _price_logged.get("fields"):
+            # One-shot: says whether include_24hr_change is actually being
+            # honoured, which is otherwise indistinguishable from a flat market.
+            _price_logged["fields"] = True
+            _debug_log(f"http price (coingecko) fields: {sorted(quotes)}")
+        if pref_gid:
+            chg_now = _change_cache.get(pref_gid)
+            if _price_logged.get("chg") != chg_now:
+                _price_logged["chg"] = chg_now
+                _debug_log(f"http price  24h change {pref_gid}={chg_now!r}")
+        if not stored:
+            # CoinGecko answers 200 with an empty or error-shaped body when it
+            # is rate limiting. Counting the request itself as success skipped
+            # the fallback below and left the price blank until the next
+            # restart, so a usable quote is what counts as success.
+            _debug_log(f"http price (coingecko) returned no usable quotes: "
+                       f"{str(quotes)[:120]}")
     except Exception as e:
         _debug_log(f"http price fetch failed (coingecko): {type(e).__name__}: {e}")
 
-    # Binance fallback when CoinGecko is unreachable.
-    if not primary_ok:
-        for code, bsym, gid in CURRENCIES:
+    def got_wanted():
+        # A response carrying every currency but the one on screen still
+        # leaves the display blank, so success keys off the wanted quote.
+        return (pref_gid in stored) if pref_gid else bool(stored)
+
+    if not got_wanted():
+        # Only the selected currency is ever displayed and switching currency
+        # kicks off a fresh fetch, so stop at the first symbol that works
+        # rather than walking them all at 5s a piece while the network is down.
+        order = [c for c in CURRENCIES if c[0] == preferred]
+        order += [c for c in CURRENCIES if c not in order]
+        for code, bsym, gid in order:
+            if bsym is None:            # no such pair — nothing to ask for
+                continue
             try:
                 url = "https://api.binance.com/api/v3/ticker/price?symbol=" + bsym
                 req = urllib.request.Request(url, headers={"User-Agent": "Tickoshi/1.0"})
                 with urllib.request.urlopen(req, timeout=5) as r:
                     data = json.loads(r.read().decode())
-                with _price_cache_lock:
-                    _price_cache[gid] = float(data["price"])
+                price = float(data["price"])
             except Exception as e:
                 _debug_log(f"http price fetch failed (binance {bsym}): {type(e).__name__}: {e}")
                 continue
+            if price > 0:
+                with _price_cache_lock:
+                    _price_cache[gid] = price
+                stored.add(gid)
+                if preferred is None or code == preferred:
+                    break
 
-    return bool(_price_cache)
+    return got_wanted()
 
 def _fetch_hashrate():
     """Populate _network_cache['hashrate_ehs'] from mempool.space's free
@@ -347,6 +514,21 @@ def _fetch_block_height():
         return height
     except Exception:
         return _block_height_cache.get("height")
+
+def _fmt_signed_pct(v):
+    """Signed percentage for the 24h and difficulty tiles.
+
+    Two decimals below 10% because a daily move of 0.4% and one of 0.44% are
+    different numbers, one above because the tile is narrow and nobody needs
+    hundredths of a 30% swing. Rounds away a signed zero: -0.04 formatted at
+    one decimal reads "-0.0", which looks like a bug.
+    """
+    if not isinstance(v, (int, float)):
+        return "--"
+    out = f"{v:+.2f}" if abs(v) < 10 else f"{v:+.1f}"
+    if float(out) == 0:
+        return "0.00" if abs(v) < 10 else "0.0"
+    return out
 
 def _fmt_fee(v):
     """Format a sat/vB number: fractional below 10, integer above.
@@ -392,10 +574,20 @@ _ws_thread = None
 _ws_stop_flag = threading.Event()
 _ws_app = None  # active WebSocketApp instance (for .close())
 _ws_keys_logged = False  # one-shot top-level-key dump per connection
+_ws_lock = threading.Lock()
+_ws_gen = 0          # identity of the run allowed to own the socket
+_ws_running = False  # a run at the current generation is serving
+_ws_logged = {}      # last logged value per feed, to keep the log from churning
+
+WS_URL           = "wss://mempool.space/api/v1/ws"
+WS_BACKOFF_MIN_S = 5
+WS_BACKOFF_MAX_S = 60
+WS_STABLE_S      = 60   # a connection up this long earns a fresh backoff
 
 def _ws_on_open(ws):
     global _ws_keys_logged
     _ws_keys_logged = False
+    _ws_logged.clear()
     _debug_log("ws CONNECTED")
     try:
         ws.send(json.dumps({"action": "init"}))
@@ -427,12 +619,17 @@ def _ws_on_message(ws, raw):
             _fees_cache["high"] = _fmt_fee(high)
             _fees_cache["med"]  = _fmt_fee(med)
             _fees_cache["low"]  = _fmt_fee(low)
-        _debug_log(
-            f"ws fees  raw=(fastest={high!r}, halfHour={med!r}, hour={low!r}, "
-            f"economy={fees.get('economyFee')!r}, minimum={fees.get('minimumFee')!r})  "
-            f"formatted=(HIGH={_fees_cache['high']!r}, MED={_fees_cache['med']!r}, "
-            f"LOW={_fees_cache['low']!r})"
-        )
+        shown = (_fees_cache["high"], _fees_cache["med"], _fees_cache["low"])
+        # mempool.space re-pushes fees every few seconds. Logging every push
+        # filled the whole 200-line window in about two minutes and scrolled
+        # every connection error out of it, so only a change earns a line.
+        if _ws_logged.get("fees") != shown:
+            _ws_logged["fees"] = shown
+            _debug_log(
+                f"ws fees  raw=(fastest={high!r}, halfHour={med!r}, hour={low!r}, "
+                f"economy={fees.get('economyFee')!r}, minimum={fees.get('minimumFee')!r})  "
+                f"formatted=(HIGH={shown[0]!r}, MED={shown[1]!r}, LOW={shown[2]!r})"
+            )
 
     # Mempool size — {"mempoolInfo": {"bytes": <vBytes>, "size": <tx_count>, ...}}
     mi = msg.get("mempoolInfo")
@@ -441,16 +638,57 @@ def _ws_on_message(ws, raw):
         if isinstance(vbytes, (int, float)) and vbytes >= 0:
             with _price_cache_lock:
                 _network_cache["mempool_mb"] = vbytes / 1_000_000.0
-            _debug_log(f"ws mempool  bytes={vbytes} -> {_network_cache['mempool_mb']:.2f} MB")
+            mb = _network_cache["mempool_mb"]
+            if _ws_logged.get("mempool") != round(mb, 2):
+                _ws_logged["mempool"] = round(mb, 2)
+                _debug_log(f"ws mempool  bytes={vbytes} -> {mb:.2f} MB")
 
-    # Hashrate — live field from difficulty-adjustment block: {"da": {"currentHashrate": <H/s>, ...}}
+    # Difficulty adjustment — {"da": {"currentHashrate", "difficultyChange",
+    # "remainingBlocks", ...}}. The hashrate tile already parsed this object;
+    # the retarget fields were arriving and being thrown away.
     da = msg.get("da")
     if isinstance(da, dict):
         hr = da.get("currentHashrate")
         if isinstance(hr, (int, float)) and hr > 0:
             with _price_cache_lock:
                 _network_cache["hashrate_ehs"] = hr / 1e18
-            _debug_log(f"ws hashrate  H/s={hr} -> {_network_cache['hashrate_ehs']:.2f} EH/s")
+            ehs = _network_cache["hashrate_ehs"]
+            if _ws_logged.get("hashrate") != round(ehs, 2):
+                _ws_logged["hashrate"] = round(ehs, 2)
+                _debug_log(f"ws hashrate  H/s={hr} -> {ehs:.2f} EH/s")
+        chg  = da.get("difficultyChange")
+        left = da.get("remainingBlocks")
+        with _price_cache_lock:
+            if isinstance(chg, (int, float)):
+                _network_cache["diff_change_pct"] = float(chg)
+            if isinstance(left, (int, float)) and left >= 0:
+                _network_cache["diff_blocks_left"] = int(left)
+
+    # Blocks — the socket sends an array on connect and a single object for
+    # each new block. Both carry height and a unix timestamp, which gives the
+    # block-age counter and a height that lands the moment a block is mined
+    # rather than on the next HTTP poll.
+    found = []
+    blks = msg.get("blocks")
+    if isinstance(blks, list):
+        found.extend(b for b in blks if isinstance(b, dict))
+    blk = msg.get("block")
+    if isinstance(blk, dict):
+        found.append(blk)
+    newest = None
+    for b in found:
+        h = b.get("height")
+        if isinstance(h, int) and (newest is None or h > newest.get("height", -1)):
+            newest = b
+    if newest is not None:
+        h  = newest.get("height")
+        ts = newest.get("timestamp")
+        with _price_cache_lock:
+            if isinstance(ts, (int, float)) and ts > 0:
+                _network_cache["block_ts"] = float(ts)
+            if isinstance(h, int) and h > (_block_height_cache.get("height") or 0):
+                _block_height_cache["height"] = h
+                _debug_log(f"ws block  height={h}")
 
     # Hashrate fallback — init payload carries a "hashrates" array of historical points.
     hrs = msg.get("hashrates")
@@ -470,40 +708,80 @@ def _ws_on_error(ws, err):
 def _ws_on_close(ws, code, reason):
     _debug_log(f"ws CLOSED code={code!r} reason={reason!r}")
 
-def _ws_run():
-    global _ws_app
-    backoff = 5
-    while not _ws_stop_flag.is_set():
+def _ws_run(gen):
+    """Connect-and-reconnect loop for one generation of the feed.
+
+    `gen` is this run's claim on the socket: _ws_start/_ws_stop bump the global
+    generation, so a run left over from an earlier stop retires at its next
+    check instead of lingering or fighting over _ws_app.
+    """
+    global _ws_app, _ws_running
+    backoff = WS_BACKOFF_MIN_S
+    while True:
+        with _ws_lock:
+            if gen != _ws_gen or _ws_stop_flag.is_set():
+                break
+        started = time.monotonic()
         try:
-            _ws_app = websocket.WebSocketApp(
-                "wss://mempool.space/api/v1/ws",
+            app = websocket.WebSocketApp(
+                WS_URL,
                 on_open    = _ws_on_open,
                 on_message = _ws_on_message,
                 on_error   = _ws_on_error,
                 on_close   = _ws_on_close,
             )
-            _ws_app.run_forever(ping_interval=25, ping_timeout=10)
+            with _ws_lock:
+                if gen != _ws_gen:
+                    break
+                _ws_app = app
+            app.run_forever(ping_interval=25, ping_timeout=10)
         except Exception as e:
             _debug_log(f"ws run_forever crash: {type(e).__name__}: {e}")
-        if _ws_stop_flag.is_set():
-            break
-        _debug_log(f"ws disconnected; retry in {backoff}s")
+        up = time.monotonic() - started
+        with _ws_lock:
+            if gen != _ws_gen or _ws_stop_flag.is_set():
+                break
+        # A connection that stayed up is evidence the network is healthy, so
+        # the next drop retries promptly. Without this the backoff only ever
+        # grew, and a few suspend/resume cycles left every later reconnect
+        # waiting the full minute for the rest of the session.
+        if up >= WS_STABLE_S:
+            backoff = WS_BACKOFF_MIN_S
+        _debug_log(f"ws disconnected after {up:.0f}s; retry in {backoff}s")
         _ws_stop_flag.wait(backoff)
-        backoff = min(backoff * 2, 60)
+        backoff = min(backoff * 2, WS_BACKOFF_MAX_S)
+
+    with _ws_lock:
+        if gen == _ws_gen:
+            _ws_running = False
+            _ws_app = None
 
 def _ws_start():
-    global _ws_thread
-    if _ws_thread is not None and _ws_thread.is_alive():
-        return
-    _ws_stop_flag.clear()
-    _ws_thread = threading.Thread(target=_ws_run, daemon=True)
-    _ws_thread.start()
+    global _ws_thread, _ws_gen, _ws_running
+    with _ws_lock:
+        _ws_stop_flag.clear()
+        if _ws_running and _ws_thread is not None and _ws_thread.is_alive():
+            return
+        # Retire any run still winding down from a previous _ws_stop(). The old
+        # is_alive() check alone let a stop-then-start — toggling a WS tile off
+        # and straight back on — return early against a thread that was about
+        # to exit, leaving the feed dead until the app restarted.
+        _ws_gen += 1
+        gen = _ws_gen
+        _ws_running = True
+        _ws_thread = threading.Thread(target=_ws_run, args=(gen,), daemon=True)
+        _ws_thread.start()
 
 def _ws_stop():
-    _ws_stop_flag.set()
-    if _ws_app is not None:
+    global _ws_gen, _ws_running, _ws_app
+    with _ws_lock:
+        _ws_gen += 1
+        _ws_running = False
+        _ws_stop_flag.set()
+        app, _ws_app = _ws_app, None
+    if app is not None:
         try:
-            _ws_app.close()
+            app.close()
         except Exception:
             pass
 
@@ -515,10 +793,16 @@ def fetch_price(currency: str = "USD") -> str | None:
         return str(int(round(price)))
     return None
 
+def next_halving_block(height: int) -> int:
+    """The next halving at or after `height`. Derived rather than hardcoded: a
+    fixed constant silently turns the tile into "--" forever once that block is
+    mined, in every binary already shipped."""
+    return (height // HALVING_INTERVAL + 1) * HALVING_INTERVAL
+
 def calc_halving_days(height: int) -> int | None:
-    if height is None or height >= NEXT_HALVING_BLOCK:
+    if not isinstance(height, int) or height < 0:
         return None
-    blocks_remaining = NEXT_HALVING_BLOCK - height
+    blocks_remaining = next_halving_block(height) - height
     minutes_remaining = blocks_remaining * 10
     return int(minutes_remaining / 60 / 24)
 
@@ -844,6 +1128,7 @@ class Tickoshi(tk.Tk):
         self._result_queue = queue.Queue()
         self._fetch_after_id = None    # pending fetch-loop timer
         self._fetch_gen = 0            # latest fetch generation; stale workers no-op
+        self._fetch_retry_s = 0        # backoff after a cycle that got nothing
 
         # Frameless, always-on-top
         if sys.platform.startswith("linux"):
@@ -876,6 +1161,7 @@ class Tickoshi(tk.Tk):
         self._bind_children()
 
         self._start_result_poller()
+        self._start_live_tick()
         self._fetch_loop()
 
         # Start mempool.space WS if any WS-fed module is enabled at startup.
@@ -1058,6 +1344,9 @@ class Tickoshi(tk.Tk):
         self._halving_panel = None
         self._hash_panel = None
         self._mempool_panel = None
+        self._change_panel = None
+        self._diff_panel = None
+        self._blockage_panel = None
 
         def _new_row():
             r = tk.Frame(container, bg=C_FACE)
@@ -1083,11 +1372,14 @@ class Tickoshi(tk.Tk):
         def _build_single_tile(parent, key, width, right_pad):
             sign = CURRENCY_SIGNS.get(self._currency, "$")
             spec = {
-                "sats":    ("SATS",   f"per {sign}"),
-                "height":  ("HEIGHT", "blk"),
-                "halving": ("HALVING", "days"),
-                "hash":    ("HASH",   "EH/s"),
-                "mempool": ("MEMP",   "MB"),
+                "sats":     ("SATS",   f"per {sign}"),
+                "change":   ("24H",    "%"),
+                "height":   ("HEIGHT", "blk"),
+                "blockage": ("BLOCK",  "ago"),
+                "halving":  ("HALVING", "days"),
+                "diff":     ("DIFF",   "%"),
+                "hash":     ("HASH",   "EH/s"),
+                "mempool":  ("MEMP",   "MB"),
             }[key]
             fb = FeeBlock(parent, total_w=width, scale=s,
                           label=spec[0], unit=spec[1],
@@ -1096,7 +1388,8 @@ class Tickoshi(tk.Tk):
             fb.pack(side="left", padx=(0, right_pad))
             attr = {"sats": "_sats_panel", "height": "_height_panel",
                     "halving": "_halving_panel", "hash": "_hash_panel",
-                    "mempool": "_mempool_panel"}[key]
+                    "mempool": "_mempool_panel", "change": "_change_panel",
+                    "diff": "_diff_panel", "blockage": "_blockage_panel"}[key]
             setattr(self, attr, fb)
 
         # Walk modules in selection order. Pair adjacent non-fees tiles into
@@ -1160,6 +1453,36 @@ class Tickoshi(tk.Tk):
             return "--"
         return f"{ehs:,.0f}" if ehs >= 100 else f"{ehs:,.1f}"
 
+    def _compute_change_str(self) -> str:
+        """24h move as a signed percentage. Only CoinGecko supplies this, so it
+        reads "--" whenever the Binance fallback provided the price."""
+        gecko_id = CURRENCY_TO_GECKO.get(self._currency, "usd")
+        with _price_cache_lock:
+            pct = _change_cache.get(gecko_id)
+        return _fmt_signed_pct(pct)
+
+    def _compute_diff_str(self) -> str:
+        """Projected change at the next retarget, signed."""
+        with _price_cache_lock:
+            pct = _network_cache.get("diff_change_pct")
+        return _fmt_signed_pct(pct)
+
+    def _compute_blockage_str(self) -> str:
+        """Time since the newest block. Recomputed every second from a stored
+        timestamp, so it ticks without needing anything from the network."""
+        with _price_cache_lock:
+            ts = _network_cache.get("block_ts")
+        if not isinstance(ts, (int, float)) or ts <= 0:
+            return "--"
+        secs = int(time.time() - ts)
+        if secs < 0:
+            secs = 0          # a block timestamp may sit slightly in the future
+        if secs < 60:
+            return f"{secs}s"
+        if secs < 3600:
+            return f"{secs // 60}m"
+        return f"{secs // 3600}h{(secs % 3600) // 60:02d}m"
+
     def _compute_mempool_str(self) -> str:
         with _price_cache_lock:
             mb = _network_cache.get("mempool_mb")
@@ -1178,6 +1501,12 @@ class Tickoshi(tk.Tk):
             self._hash_panel.set_value(self._compute_hash_str())
         if self._mempool_panel is not None:
             self._mempool_panel.set_value(self._compute_mempool_str())
+        if self._change_panel is not None:
+            self._change_panel.set_value(self._compute_change_str())
+        if self._diff_panel is not None:
+            self._diff_panel.set_value(self._compute_diff_str())
+        if self._blockage_panel is not None:
+            self._blockage_panel.set_value(self._compute_blockage_str())
 
     # ── Border pulse animation ────────────────────────────────────────────────
     def _pulse(self, color):
@@ -1286,13 +1615,43 @@ class Tickoshi(tk.Tk):
                     fn = self._result_queue.get_nowait()
                     try:
                         fn()
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        # Swallowed so one bad result can't kill the poller,
+                        # but never silently — this is where a render fault
+                        # would otherwise vanish without trace.
+                        _debug_log(f"result callback failed: "
+                                   f"{type(e).__name__}: {e}")
             except queue.Empty:
                 pass
             if self.winfo_exists():
                 self.after(50, _poll)
         self.after(50, _poll)
+
+    def _start_live_tick(self):
+        """Repaint the secondary tiles once a second.
+
+        The block-age counter has to advance on its own, with no new data to
+        prompt it. set_value() is a no-op unless the rendered text actually
+        changed, so this costs a few string comparisons per second — and it
+        also keeps the socket-fed tiles current instead of leaving them until
+        the next price cycle, which on a 60-minute interval is an hour away.
+        """
+        self._tick_error_logged = False
+
+        def _tick():
+            if not self.winfo_exists():
+                return
+            try:
+                self._update_secondary_panels()
+            except Exception as e:
+                # Cosmetic, and it must not stop the timer or flood a 200-line
+                # log at one line a second, so say it once and carry on.
+                if not self._tick_error_logged:
+                    self._tick_error_logged = True
+                    _debug_log(f"tile tick failed: {type(e).__name__}: {e}")
+            self.after(1000, _tick)
+
+        self.after(1000, _tick)
 
     def _fetch_loop(self):
         # Cancel any pending next-tick timer so we don't stack loops.
@@ -1315,31 +1674,63 @@ class Tickoshi(tk.Tk):
         needs_height = ("height" in modules) or ("halving" in modules)
 
         def _worker():
-            _fetch_all_prices()
-            if needs_height:
-                _fetch_block_height()
-            if "hash" in modules:
-                _fetch_hashrate()
-            # Fees + mempool are pushed via WebSocket — no HTTP fetch needed.
-            display = fetch_price(currency)
-            self._result_queue.put(
-                lambda: self._on_fetch_done(display, currency, modules, gen))
+            # The queued callback is what schedules the next cycle, so it must
+            # be posted no matter what happens above it. An exception escaping
+            # this thread would stop the widget refreshing for the rest of the
+            # session — which looks exactly like "the price stopped working".
+            display, refreshed = None, False
+            try:
+                refreshed = _fetch_all_prices(currency)
+                if needs_height:
+                    _fetch_block_height()
+                if "hash" in modules:
+                    _fetch_hashrate()
+                # Fees + mempool arrive over the WebSocket — no fetch here.
+                display = fetch_price(currency)
+                if not refreshed:
+                    _debug_log(f"fetch cycle: no live {currency} price from any "
+                               f"source (showing "
+                               f"{'last known' if display else 'nothing'})")
+            except Exception as e:
+                _debug_log(f"fetch worker crashed: {type(e).__name__}: {e}")
+            finally:
+                self._result_queue.put(
+                    lambda: self._on_fetch_done(display, currency, modules,
+                                                gen, refreshed))
 
         threading.Thread(target=_worker, daemon=True).start()
 
-    def _on_fetch_done(self, display, currency, modules, gen):
+    def _on_fetch_done(self, display, currency, modules, gen, refreshed=True):
         # Stale worker (a newer _fetch_loop has superseded this one) — drop it
         # and in particular don't reschedule, or we'd end up with two timers.
         if gen != self._fetch_gen:
             return
-        # Discard stale results from before a currency/module change.
-        if currency != self._currency or modules != frozenset(self._modules):
-            return
-        self._last_price_str = display
-        self._update_display(display)
-        if self.winfo_exists():
-            self._fetch_after_id = self.after(
-                self._refresh_s * 1000, self._fetch_loop)
+        try:
+            # Discard stale results from before a currency/module change; that
+            # change restarts the loop itself, so this cycle just stops here.
+            if (currency == self._currency
+                    and modules == frozenset(self._modules)):
+                self._last_price_str = display
+                self._update_display(display)
+        finally:
+            # Rescheduling has to survive a render error. The result poller
+            # swallows whatever is raised in here, so a single Tcl error
+            # escaping this method used to cancel every future refresh.
+            if gen == self._fetch_gen and self.winfo_exists():
+                self._fetch_after_id = self.after(
+                    int(self._next_fetch_delay(refreshed) * 1000),
+                    self._fetch_loop)
+
+    def _next_fetch_delay(self, refreshed: bool) -> float:
+        """Seconds until the next fetch: the user's interval when the last one
+        worked, a short escalating retry when it came back empty."""
+        if refreshed:
+            self._fetch_retry_s = 0
+            return self._refresh_s
+        self._fetch_retry_s = min(
+            max(self._fetch_retry_s * 2, FETCH_RETRY_MIN_S), FETCH_RETRY_MAX_S)
+        # Never retry more slowly than the interval the user actually picked.
+        return min(self._fetch_retry_s, self._refresh_s)
 
     # ── Bindings ──────────────────────────────────────────────────────────────
     def _bind_children(self):
@@ -1468,6 +1859,12 @@ class Tickoshi(tk.Tk):
         menu.add_command(label=f"  Lock{lock_check}",
                          command=self._menu_toggle_lock)
 
+        # Read the OS every time the menu opens rather than trusting a stored
+        # flag, so an entry removed behind our back shows as off.
+        auto_check = " \u2713" if autostart_enabled() else ""
+        menu.add_command(label=f"  Start at login{auto_check}",
+                         command=self._menu_toggle_autostart)
+
         menu.add_separator()
         menu.add_command(label="  Close", command=self._menu_quit)
 
@@ -1565,6 +1962,13 @@ class Tickoshi(tk.Tk):
     def _menu_toggle_flash(self):
         self._flash_enabled = not self._flash_enabled
         self._save_config()
+
+    def _menu_toggle_autostart(self):
+        want = not autostart_enabled()
+        got = set_autostart(want)
+        _debug_log(f"autostart {'enabled' if got else 'disabled'}"
+                   + ("" if got == want else "  (requested "
+                      f"{'enable' if want else 'disable'}, and it did not take)"))
 
     def _menu_toggle_lock(self):
         self._locked = not self._locked
