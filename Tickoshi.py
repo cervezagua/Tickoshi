@@ -66,14 +66,18 @@ DRUM_MS    = 14
 # Size presets: name → scale factor
 SIZES = {"Small": 0.7, "Medium": 1.0, "Large": 1.4}
 
-# Currencies: code → (Binance symbol, CoinGecko id)
+# Currencies: code → (Binance symbol or None, CoinGecko id).
+# None means Binance has no such spot pair, so there is nothing to ask it for:
+# BTC/GBP was delisted 2023-12-29 and BTC/RUB on 2024-01-30 with the Russia
+# exit. Requesting them returns 400 {"code":-1121,"msg":"Invalid symbol."}
+# every single time. (BTC/JPY does exist — added globally 2024-03-12.)
 CURRENCIES = [
     ("USD", "BTCUSDT", "usd"),
     ("TRY", "BTCTRY",  "try"),
     ("EUR", "BTCEUR",  "eur"),
-    ("GBP", "BTCGBP",  "gbp"),
+    ("GBP", None,      "gbp"),
     ("JPY", "BTCJPY",  "jpy"),
-    ("RUB", "BTCRUB",  "rub"),
+    ("RUB", None,      "rub"),
 ]
 CURRENCY_TO_GECKO = {code: gid for code, _, gid in CURRENCIES}
 
@@ -316,16 +320,21 @@ def _ws_feed_is_live() -> bool:
     return _is_fresh(_ws_alive_ts)
 
 def _http_get(url, timeout=8, what=""):
-    """GET `url` and return the decoded body, or None on failure.
+    """GET `url`, returning `(body, status)`.
 
-    Failures are logged with the detail that actually tells the modes apart:
-    an HTTP status plus the server's own error body (rate limit, invalid
-    symbol) versus a transport error (DNS, TLS, timeout, no route).
+    `body` is None on any failure. `status` is the HTTP code when the server
+    answered and None when the request never got that far, which is what lets
+    a caller tell "this host refuses my whole country" (451) from "that one
+    symbol was wrong" (400) from "no network at all".
+
+    Failures are logged with the detail that tells those modes apart: a status
+    plus the server's own error body, or the transport exception.
     """
     req = urllib.request.Request(url, headers={"User-Agent": "Tickoshi/1.0"})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            return r.read().decode()
+            # Not every response object carries .status (addinfourl does not).
+            return r.read().decode(), getattr(r, "status", None)
     except urllib.error.HTTPError as e:
         body = ""
         try:
@@ -334,81 +343,148 @@ def _http_get(url, timeout=8, what=""):
             pass
         _debug_log(f"http {what} failed: HTTP {e.code} {e.reason}"
                    + (f"  body={body}" if body else ""))
+        return None, e.code
     except Exception as e:
         _debug_log(f"http {what} failed: {type(e).__name__}: {e}")
-    return None
+    return None, None
+
+def _prices_coingecko():
+    """One request covers every currency. Keyless, but the free tier throttles
+    hard (429 after a handful of rapid calls) and the 429 body is sometimes
+    plain text rather than JSON — hence no assumption that it parses."""
+    ids = ",".join(gid for _, _, gid in CURRENCIES)
+    body, _ = _http_get(
+        "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin"
+        "&vs_currencies=" + ids, timeout=8, what="price (coingecko)")
+    if body is None:
+        return {}
+    try:
+        quotes = json.loads(body).get("bitcoin") or {}
+    except Exception as e:
+        _debug_log(f"http price (coingecko) bad body: {type(e).__name__}: {e}")
+        return {}
+    out = {gid: float(quotes[gid]) for _, _, gid in CURRENCIES
+           if isinstance(quotes.get(gid), (int, float)) and quotes[gid] > 0}
+    if not out:
+        # A 200 whose body carries no usable quote still means no price, so it
+        # has to fall through to the next source rather than count as success.
+        _debug_log(f"http price (coingecko) no usable quotes: {body[:160]}")
+    return out
+
+def _prices_blockchain_info():
+    """https://blockchain.info/ticker — one keyless request, every currency,
+    and a host this app already depends on for block height.
+    Shape: {"USD": {"last": 93000.0, ...}, ...} with numeric values."""
+    body, _ = _http_get("https://blockchain.info/ticker", timeout=8,
+                        what="price (blockchain.info)")
+    if body is None:
+        return {}
+    try:
+        data = json.loads(body)
+    except Exception as e:
+        _debug_log(f"http price (blockchain.info) bad body: "
+                   f"{type(e).__name__}: {e}")
+        return {}
+    out = {}
+    for code, _, gid in CURRENCIES:
+        row = data.get(code) if isinstance(data, dict) else None
+        v = row.get("last") if isinstance(row, dict) else None
+        if isinstance(v, (int, float)) and v > 0:
+            out[gid] = float(v)
+    return out
+
+def _prices_coinbase():
+    """Coinbase exchange-rates — one keyless request, every currency, and not
+    geo-restricted. Rates arrive as STRINGS under data.rates.<CODE>."""
+    body, _ = _http_get(
+        "https://api.coinbase.com/v2/exchange-rates?currency=BTC",
+        timeout=8, what="price (coinbase)")
+    if body is None:
+        return {}
+    try:
+        rates = ((json.loads(body).get("data") or {}).get("rates")) or {}
+    except Exception as e:
+        _debug_log(f"http price (coinbase) bad body: {type(e).__name__}: {e}")
+        return {}
+    out = {}
+    for code, _, gid in CURRENCIES:
+        try:
+            v = float(rates[code])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if v > 0:
+            out[gid] = v
+    return out
+
+def _prices_binance(preferred=None):
+    """Per-symbol, so only the currency on screen is worth the round trip.
+    Last in the chain because Binance answers 451 to entire countries; that
+    status abandons the host outright rather than stalling the cycle on five
+    more symbols that will be refused in exactly the same way."""
+    order = [c for c in CURRENCIES if c[0] == preferred]
+    order += [c for c in CURRENCIES if c not in order]
+    out = {}
+    for code, bsym, gid in order:
+        if bsym is None:                      # no such pair — nothing to ask
+            continue
+        body, status = _http_get(
+            "https://api.binance.com/api/v3/ticker/price?symbol=" + bsym,
+            timeout=5, what=f"price (binance {bsym})")
+        if status == 451:
+            _debug_log("http price (binance) refuses this location "
+                       "(HTTP 451); skipping the remaining symbols")
+            break
+        if body is None:
+            continue
+        try:
+            price = float(json.loads(body)["price"])
+        except Exception as e:
+            _debug_log(f"http price (binance {bsym}) bad body: "
+                       f"{type(e).__name__}: {e}")
+            continue
+        if price > 0:
+            out[gid] = price
+            if preferred is None or code == preferred:
+                break
+    return out
+
+# Tried in order until the currency on screen has a quote. All keyless. The
+# first three each cover every currency in a single request.
+_PRICE_SOURCES = (_prices_coingecko, _prices_blockchain_info, _prices_coinbase)
 
 def _fetch_all_prices(preferred: str | None = None):
-    """Refresh the price cache: CoinGecko first (one request covers every
-    currency), Binance per-symbol as the fallback.
+    """Refresh the price cache from the first source that answers.
 
     Returns True if *this call* got a live quote for `preferred`. The cache
     keeps the last good price, so asking whether it is non-empty would report
     success indefinitely after the network dropped.
     """
-    gecko_ids = ",".join(gid for _, _, gid in CURRENCIES)
     pref_gid = CURRENCY_TO_GECKO.get(preferred)
     stored = set()
 
-    body = _http_get(
-        "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies="
-        + gecko_ids, timeout=8, what="price (coingecko)")
-    if body is not None:
-        try:
-            quotes = json.loads(body).get("bitcoin") or {}
-        except Exception as e:
-            quotes = {}
-            _debug_log(f"http price (coingecko) bad body: {type(e).__name__}: {e}")
-        with _price_cache_lock:
-            for _, _, gid in CURRENCIES:
-                v = quotes.get(gid)
-                if isinstance(v, (int, float)) and v > 0:
-                    _price_cache[gid] = float(v)
-                    stored.add(gid)
-        if not stored:
-            # CoinGecko answers 200 with an empty or error-shaped body when it
-            # is rate limiting or an id is unknown. Treating the request itself
-            # as success there skipped the fallback and left the price blank
-            # until restart, so a usable quote is what counts as success.
-            _debug_log(f"http price (coingecko) no usable quotes: {body[:160]}")
+    def store(quotes):
+        if quotes:
+            with _price_cache_lock:
+                _price_cache.update(quotes)
+            stored.update(quotes)
 
-    def _got_wanted():
-        # A response that carried every currency but the one on screen still
+    def got_wanted():
+        # A response carrying every currency but the one on screen still
         # leaves the display blank, so success keys off the wanted quote.
         return (pref_gid in stored) if pref_gid else bool(stored)
 
-    if not _got_wanted():
-        # Only the selected currency is ever displayed and switching currency
-        # kicks off a fresh fetch, so stop at the first working symbol rather
-        # than walking all six at up to 5s each while the network is down.
-        order = [c for c in CURRENCIES if c[0] == preferred]
-        order += [c for c in CURRENCIES if c not in order]
-        for code, bsym, gid in order:
-            body = _http_get(
-                "https://api.binance.com/api/v3/ticker/price?symbol=" + bsym,
-                timeout=5, what=f"price (binance {bsym})")
-            if body is None:
-                continue
-            try:
-                price = float(json.loads(body)["price"])
-            except Exception as e:
-                _debug_log(f"http price (binance {bsym}) bad body: "
-                           f"{type(e).__name__}: {e}")
-                continue
-            if price > 0:
-                with _price_cache_lock:
-                    _price_cache[gid] = price
-                stored.add(gid)
-                if preferred is None or code == preferred:
-                    break
-
-    return _got_wanted()
+    for source in _PRICE_SOURCES:
+        store(source())
+        if got_wanted():
+            return True
+    store(_prices_binance(preferred))
+    return got_wanted()
 
 def _fetch_hashrate():
     """Populate _network_cache['hashrate_ehs'] from mempool.space's free
     mining endpoint. Endpoint returns {"currentHashrate": <H/s>, ...}."""
-    body = _http_get("https://mempool.space/api/v1/mining/hashrate/3d",
-                     timeout=8, what="hashrate")
+    body, _ = _http_get("https://mempool.space/api/v1/mining/hashrate/3d",
+                        timeout=8, what="hashrate")
     if body is None:
         return None
     try:
@@ -427,8 +503,8 @@ def _fetch_hashrate():
     return None
 
 def _fetch_block_height():
-    body = _http_get("https://blockchain.info/q/getblockcount", timeout=8,
-                     what="block height")
+    body, _ = _http_get("https://blockchain.info/q/getblockcount", timeout=8,
+                        what="block height")
     if body is not None:
         try:
             height = int(body.strip())
