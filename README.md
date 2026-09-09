@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.1-orange?style=flat-square" />
+  <img src="https://img.shields.io/badge/version-1.2-orange?style=flat-square" />
 </p>
 
 <p align="center">
@@ -23,9 +23,12 @@
 ## Features
 
 - **Live price** — customizable refresh interval (1 min – 1 hr) via CoinGecko (Binance fallback)
-- **Modular secondary tiles** — pick any combination of Fees, Sats, Block Height, Halving, Hashrate, Mempool. Tiles stack under the price in the order you enable them and auto-pair two-per-row to keep the widget compact
+- **Modular secondary tiles** — pick any combination of Fees, Sats, 24h Change, Block Height, Block Age, Halving, Difficulty, Hashrate, Mempool. Tiles stack under the price in the order you enable them and auto-pair two-per-row to keep the widget compact
 - **Live mempool feed** — LOW / MED / HIGH priority sat/vB values streamed from mempool.space's WebSocket, matching the site's homepage tiles exactly
 - **Hashrate + mempool size** — network health tiles (EH/s and MB) fed from mempool.space
+- **24h change** — signed percentage move, arriving on the same request as the price
+- **Block age + difficulty retarget** — seconds since the last block, ticking live, and the projected change at the next retarget
+- **Start at login** — one menu toggle, registered with the OS (Windows, macOS and Linux)
 - **Currency sign panel** — displays $, ₺, €, £, ¥, ₽ next to the price
 - **Flip animation** — smooth drum-roll transition on every digit change
 - **Accordion layout** — panels adjust automatically to match the digit count
@@ -116,6 +119,7 @@ Produces `dist/Tickoshi.app` (ad-hoc signed) and `dist/Tickoshi-macos.zip` (read
 | Change border color | Right-click → **Border** |
 | Toggle always-on-top | Right-click → **Always on top** |
 | Toggle price flash | Right-click → **Price flash** |
+| Start with the computer | Right-click → **Start at login** |
 | Lock position | Right-click → **Lock** |
 | Close | Right-click → **Close** |
 
@@ -127,10 +131,15 @@ The main row always shows the live BTC price. Enable any of these optional tiles
 |---|---|---|
 | **Fees** | Low / Medium / High priority (sat/vB) | mempool.space WebSocket |
 | **Sats** | Sats per unit of selected currency | Computed from price |
-| **Block Height** | Current block number | blockchain.info |
+| **24h Change** | Signed % move over 24 hours | CoinGecko (same request as the price) |
+| **Block Height** | Current block number | mempool.space WebSocket, blockchain.info fallback |
+| **Block Age** | Time since the last block, ticking | mempool.space WebSocket |
 | **Halving** | Days until next halving | Computed from block height |
+| **Difficulty** | Projected % change at the next retarget | mempool.space WebSocket |
 | **Hashrate** | Network hashrate (EH/s, 3-day avg) | mempool.space |
 | **Mempool** | Unconfirmed vBytes (MB) | mempool.space WebSocket |
+
+> The 24h Change tile reads `--` when the price came from the Binance fallback: that endpoint carries no 24h figure, and a stale percentage beside a fresh price would be worse than none.
 
 ### Supported currencies
 
@@ -147,7 +156,7 @@ The main row always shows the live BTC price. Enable any of these optional tiles
 
 1 min · 5 min · 15 min · 30 min · 1 hr
 
-Fees and mempool size push over a persistent WebSocket and update independently of this interval.
+Fees, mempool size, block height/age and difficulty push over a persistent WebSocket and update independently of this interval. A cycle that fetches no live price retries within seconds rather than waiting out the whole interval.
 
 ---
 
@@ -180,6 +189,22 @@ A rolling `tickoshi_debug.log` (last 200 lines) sits alongside the config for tr
 ---
 
 ## Release notes
+
+### 1.2
+
+**New**
+- Three tiles: **24h Change**, **Block Age** (ticks live) and **Difficulty** (projected retarget). The latter two cost no extra requests — the data was already arriving on the mempool.space socket and being discarded.
+- **Start at login** toggle — `Run` registry value on Windows, LaunchAgent on macOS, autostart `.desktop` on Linux. Read back from the OS, so the checkmark can't disagree with reality.
+- Block height now lands the moment a block is mined, instead of on the next HTTP poll.
+
+**Fixed**
+- Price could stay blank until restart. A CoinGecko response that carried no usable quote still counted as success, so the Binance fallback never ran.
+- A failed fetch waited out the whole refresh interval — up to an hour of dashes after a single rate limit. Now retries in seconds.
+- Toggling a WebSocket tile off and back on killed fees/mempool/hashrate for the rest of the session; reconnect backoff also never reset after a sleep/wake.
+- One exception in a fetch or a redraw stopped all future refreshes, silently.
+- The debug log filled its whole 200-line window in about two minutes, scrolling out every error just when it was needed.
+- The Halving tile would have read `--` forever from block 1,050,000; the next halving is now derived rather than hardcoded.
+- `BTC/GBP` and `BTC/RUB` were requested from Binance on every fallback despite being delisted, returning `Invalid symbol` each time.
 
 ### 1.1
 
