@@ -283,69 +283,151 @@ class FlipCard(tk.Frame):
 _price_cache = {}
 _block_height_cache = {"height": None}
 _fees_cache = {"low": None, "med": None, "high": None}
-_network_cache = {"hashrate_ehs": None, "mempool_mb": None}
+# "hashrate_ts" marks when a hashrate last arrived, so the historical figure in
+# the WS init payload doesn't overwrite a current one.
+_network_cache = {"hashrate_ehs": None, "hashrate_ts": None, "mempool_mb": None}
 _price_cache_lock = threading.Lock()
 
-def _fetch_all_prices():
-    gecko_ids = ",".join(gid for _, _, gid in CURRENCIES)
-    primary_ok = False
+# Fees and mempool size arrive only over the WebSocket, so when that feed goes
+# quiet there is nothing to refresh them and the last reading would sit on
+# screen looking live. Freshness is judged on the connection rather than on the
+# individual field: mempool.space decides how often it repeats any given value,
+# but a socket that has pushed nothing at all for this long is dead.
+STALE_AFTER_S = 600
+_ws_alive_ts = None   # time of the last message accepted from the WebSocket
+
+def _is_fresh(ts) -> bool:
+    return isinstance(ts, (int, float)) and (time.time() - ts) < STALE_AFTER_S
+
+def _ws_feed_is_live() -> bool:
+    return _is_fresh(_ws_alive_ts)
+
+def _http_get(url, timeout=8, what=""):
+    """GET `url` and return the decoded body, or None on failure.
+
+    Failures are logged with the detail that actually tells the modes apart:
+    an HTTP status plus the server's own error body (rate limit, invalid
+    symbol) versus a transport error (DNS, TLS, timeout, no route).
+    """
+    req = urllib.request.Request(url, headers={"User-Agent": "Tickoshi/1.0"})
     try:
-        url = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=" + gecko_ids
-        req = urllib.request.Request(url, headers={"User-Agent": "Tickoshi/1.0"})
-        with urllib.request.urlopen(req, timeout=8) as r:
-            data = json.loads(r.read().decode())
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.read().decode()
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode(errors="replace").strip()[:160]
+        except Exception:
+            pass
+        _debug_log(f"http {what} failed: HTTP {e.code} {e.reason}"
+                   + (f"  body={body}" if body else ""))
+    except Exception as e:
+        _debug_log(f"http {what} failed: {type(e).__name__}: {e}")
+    return None
+
+def _fetch_all_prices(preferred: str | None = None):
+    """Refresh the price cache: CoinGecko first (one request covers every
+    currency), Binance per-symbol as the fallback.
+
+    Returns True if *this call* got a live quote for `preferred`. The cache
+    keeps the last good price, so asking whether it is non-empty would report
+    success indefinitely after the network dropped.
+    """
+    gecko_ids = ",".join(gid for _, _, gid in CURRENCIES)
+    pref_gid = CURRENCY_TO_GECKO.get(preferred)
+    stored = set()
+
+    body = _http_get(
+        "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies="
+        + gecko_ids, timeout=8, what="price (coingecko)")
+    if body is not None:
+        try:
+            quotes = json.loads(body).get("bitcoin") or {}
+        except Exception as e:
+            quotes = {}
+            _debug_log(f"http price (coingecko) bad body: {type(e).__name__}: {e}")
         with _price_cache_lock:
             for _, _, gid in CURRENCIES:
-                if gid in data.get("bitcoin", {}):
-                    _price_cache[gid] = float(data["bitcoin"][gid])
-        primary_ok = True
-    except Exception as e:
-        _debug_log(f"http price fetch failed (coingecko): {type(e).__name__}: {e}")
+                v = quotes.get(gid)
+                if isinstance(v, (int, float)) and v > 0:
+                    _price_cache[gid] = float(v)
+                    stored.add(gid)
+        if not stored:
+            # CoinGecko answers 200 with an empty or error-shaped body when it
+            # is rate limiting or an id is unknown. Treating the request itself
+            # as success there skipped the fallback and left the price blank
+            # until restart, so a usable quote is what counts as success.
+            _debug_log(f"http price (coingecko) no usable quotes: {body[:160]}")
 
-    # Binance fallback when CoinGecko is unreachable.
-    if not primary_ok:
-        for code, bsym, gid in CURRENCIES:
-            try:
-                url = "https://api.binance.com/api/v3/ticker/price?symbol=" + bsym
-                req = urllib.request.Request(url, headers={"User-Agent": "Tickoshi/1.0"})
-                with urllib.request.urlopen(req, timeout=5) as r:
-                    data = json.loads(r.read().decode())
-                with _price_cache_lock:
-                    _price_cache[gid] = float(data["price"])
-            except Exception as e:
-                _debug_log(f"http price fetch failed (binance {bsym}): {type(e).__name__}: {e}")
+    def _got_wanted():
+        # A response that carried every currency but the one on screen still
+        # leaves the display blank, so success keys off the wanted quote.
+        return (pref_gid in stored) if pref_gid else bool(stored)
+
+    if not _got_wanted():
+        # Only the selected currency is ever displayed and switching currency
+        # kicks off a fresh fetch, so stop at the first working symbol rather
+        # than walking all six at up to 5s each while the network is down.
+        order = [c for c in CURRENCIES if c[0] == preferred]
+        order += [c for c in CURRENCIES if c not in order]
+        for code, bsym, gid in order:
+            body = _http_get(
+                "https://api.binance.com/api/v3/ticker/price?symbol=" + bsym,
+                timeout=5, what=f"price (binance {bsym})")
+            if body is None:
                 continue
+            try:
+                price = float(json.loads(body)["price"])
+            except Exception as e:
+                _debug_log(f"http price (binance {bsym}) bad body: "
+                           f"{type(e).__name__}: {e}")
+                continue
+            if price > 0:
+                with _price_cache_lock:
+                    _price_cache[gid] = price
+                stored.add(gid)
+                if preferred is None or code == preferred:
+                    break
 
-    return bool(_price_cache)
+    return _got_wanted()
 
 def _fetch_hashrate():
     """Populate _network_cache['hashrate_ehs'] from mempool.space's free
     mining endpoint. Endpoint returns {"currentHashrate": <H/s>, ...}."""
+    body = _http_get("https://mempool.space/api/v1/mining/hashrate/3d",
+                     timeout=8, what="hashrate")
+    if body is None:
+        return None
     try:
-        url = "https://mempool.space/api/v1/mining/hashrate/3d"
-        req = urllib.request.Request(url, headers={"User-Agent": "Tickoshi/1.0"})
-        with urllib.request.urlopen(req, timeout=8) as r:
-            data = json.loads(r.read().decode())
-        hr = data.get("currentHashrate")
-        if isinstance(hr, (int, float)) and hr > 0:
-            with _price_cache_lock:
-                _network_cache["hashrate_ehs"] = hr / 1e18
-            _debug_log(f"http hashrate  H/s={hr} -> {_network_cache['hashrate_ehs']:.2f} EH/s")
-            return _network_cache["hashrate_ehs"]
+        hr = json.loads(body).get("currentHashrate")
     except Exception as e:
-        _debug_log(f"http hashrate fetch failed: {type(e).__name__}: {e}")
+        _debug_log(f"http hashrate bad body: {type(e).__name__}: {e}")
+        return None
+    if isinstance(hr, (int, float)) and hr > 0:
+        with _price_cache_lock:
+            _network_cache["hashrate_ehs"] = hr / 1e18
+            _network_cache["hashrate_ts"] = time.time()
+            ehs = _network_cache["hashrate_ehs"]
+        _debug_log(f"http hashrate  H/s={hr} -> {ehs:.2f} EH/s")
+        return ehs
+    _debug_log(f"http hashrate no usable currentHashrate: {body[:120]}")
     return None
 
 def _fetch_block_height():
-    try:
-        url = "https://blockchain.info/q/getblockcount"
-        req = urllib.request.Request(url, headers={"User-Agent": "Tickoshi/1.0"})
-        with urllib.request.urlopen(req, timeout=8) as r:
-            height = int(r.read().decode().strip())
-        with _price_cache_lock:
-            _block_height_cache["height"] = height
-        return height
-    except Exception:
+    body = _http_get("https://blockchain.info/q/getblockcount", timeout=8,
+                     what="block height")
+    if body is not None:
+        try:
+            height = int(body.strip())
+        except ValueError:
+            # Previously swallowed with no log at all, which made a failing
+            # height the one connectivity fault invisible in the debug log.
+            _debug_log(f"http block height unparseable: {body[:80]!r}")
+        else:
+            with _price_cache_lock:
+                _block_height_cache["height"] = height
+            return height
+    with _price_cache_lock:
         return _block_height_cache.get("height")
 
 def _fmt_fee(v):
@@ -385,6 +467,28 @@ def _debug_log(msg: str):
     except Exception:
         pass
 
+def _log_startup_env():
+    """First line of every session's log: the facts a connectivity report
+    otherwise has to guess at — interpreter, platform, client version, whether
+    a proxy is in play, and whether there is a CA store to verify TLS against
+    (an empty one is what makes every HTTPS/WSS call fail to verify)."""
+    try:
+        ws_ver = getattr(websocket, "__version__", "?")
+    except Exception:
+        ws_ver = "?"
+    try:
+        import ssl
+        ca_count = ssl.create_default_context().cert_store_stats()["x509_ca"]
+    except Exception as e:
+        ca_count = f"unavailable ({type(e).__name__})"
+    # Names only — proxy URLs routinely embed credentials.
+    proxy_vars = sorted(k for k in os.environ
+                        if k.lower() in ("http_proxy", "https_proxy",
+                                         "all_proxy", "no_proxy"))
+    _debug_log(f"--- {APP_NAME} start  python={sys.version.split()[0]} "
+               f"platform={sys.platform}  websocket-client={ws_ver}  "
+               f"ca_certs={ca_count}  proxy_env={proxy_vars or 'none'}")
+
 # ── Mempool.space WebSocket: source of truth for Priority tile values ─────────
 # Public, free endpoint. Pushes live `fees` object with fractional sat/vB values
 # that /fees/recommended REST clamps to integer >= 1.
@@ -392,10 +496,20 @@ _ws_thread = None
 _ws_stop_flag = threading.Event()
 _ws_app = None  # active WebSocketApp instance (for .close())
 _ws_keys_logged = False  # one-shot top-level-key dump per connection
+_ws_lock = threading.Lock()
+_ws_gen = 0        # identity of the run allowed to own the socket
+_ws_running = False  # a run at the current generation is serving
+_ws_logged = {}    # last logged value per feed, to keep the log from churning
+
+WS_URL           = "wss://mempool.space/api/v1/ws"
+WS_BACKOFF_MIN_S = 5
+WS_BACKOFF_MAX_S = 60
+WS_STABLE_S      = 60   # a connection up this long earns a fresh backoff
 
 def _ws_on_open(ws):
     global _ws_keys_logged
     _ws_keys_logged = False
+    _ws_logged.clear()
     _debug_log("ws CONNECTED")
     try:
         ws.send(json.dumps({"action": "init"}))
@@ -405,13 +519,14 @@ def _ws_on_open(ws):
         _debug_log(f"ws subscribe fail: {type(e).__name__}: {e}")
 
 def _ws_on_message(ws, raw):
-    global _ws_keys_logged
+    global _ws_keys_logged, _ws_alive_ts
     try:
         msg = json.loads(raw)
     except Exception:
         return
     if not isinstance(msg, dict):
         return
+    _ws_alive_ts = time.time()
 
     if not _ws_keys_logged:
         _debug_log(f"ws first-msg keys: {sorted(msg.keys())}")
@@ -427,12 +542,17 @@ def _ws_on_message(ws, raw):
             _fees_cache["high"] = _fmt_fee(high)
             _fees_cache["med"]  = _fmt_fee(med)
             _fees_cache["low"]  = _fmt_fee(low)
-        _debug_log(
-            f"ws fees  raw=(fastest={high!r}, halfHour={med!r}, hour={low!r}, "
-            f"economy={fees.get('economyFee')!r}, minimum={fees.get('minimumFee')!r})  "
-            f"formatted=(HIGH={_fees_cache['high']!r}, MED={_fees_cache['med']!r}, "
-            f"LOW={_fees_cache['low']!r})"
-        )
+            shown = (_fees_cache["high"], _fees_cache["med"], _fees_cache["low"])
+        # mempool.space re-pushes fees every few seconds. Logging every push
+        # rolled connection errors out of the 200-line window within minutes,
+        # so only a change earns a line.
+        if _ws_logged.get("fees") != shown:
+            _ws_logged["fees"] = shown
+            _debug_log(
+                f"ws fees  raw=(fastest={high!r}, halfHour={med!r}, hour={low!r}, "
+                f"economy={fees.get('economyFee')!r}, minimum={fees.get('minimumFee')!r})  "
+                f"formatted=(HIGH={shown[0]!r}, MED={shown[1]!r}, LOW={shown[2]!r})"
+            )
 
     # Mempool size — {"mempoolInfo": {"bytes": <vBytes>, "size": <tx_count>, ...}}
     mi = msg.get("mempoolInfo")
@@ -441,7 +561,10 @@ def _ws_on_message(ws, raw):
         if isinstance(vbytes, (int, float)) and vbytes >= 0:
             with _price_cache_lock:
                 _network_cache["mempool_mb"] = vbytes / 1_000_000.0
-            _debug_log(f"ws mempool  bytes={vbytes} -> {_network_cache['mempool_mb']:.2f} MB")
+                mb = _network_cache["mempool_mb"]
+            if _ws_logged.get("mempool") != round(mb, 2):
+                _ws_logged["mempool"] = round(mb, 2)
+                _debug_log(f"ws mempool  bytes={vbytes} -> {mb:.2f} MB")
 
     # Hashrate — live field from difficulty-adjustment block: {"da": {"currentHashrate": <H/s>, ...}}
     da = msg.get("da")
@@ -450,7 +573,11 @@ def _ws_on_message(ws, raw):
         if isinstance(hr, (int, float)) and hr > 0:
             with _price_cache_lock:
                 _network_cache["hashrate_ehs"] = hr / 1e18
-            _debug_log(f"ws hashrate  H/s={hr} -> {_network_cache['hashrate_ehs']:.2f} EH/s")
+                _network_cache["hashrate_ts"] = time.time()
+                ehs = _network_cache["hashrate_ehs"]
+            if _ws_logged.get("hashrate") != round(ehs, 2):
+                _ws_logged["hashrate"] = round(ehs, 2)
+                _debug_log(f"ws hashrate  H/s={hr} -> {ehs:.2f} EH/s")
 
     # Hashrate fallback — init payload carries a "hashrates" array of historical points.
     hrs = msg.get("hashrates")
@@ -461,8 +588,9 @@ def _ws_on_message(ws, raw):
             if isinstance(hr, (int, float)) and hr > 0:
                 with _price_cache_lock:
                     # Don't overwrite a fresher "da.currentHashrate" value.
-                    if _network_cache["hashrate_ehs"] is None:
+                    if not _is_fresh(_network_cache["hashrate_ts"]):
                         _network_cache["hashrate_ehs"] = hr / 1e18
+                        _network_cache["hashrate_ts"] = time.time()
 
 def _ws_on_error(ws, err):
     _debug_log(f"ws ERROR: {type(err).__name__}: {err}")
@@ -470,42 +598,84 @@ def _ws_on_error(ws, err):
 def _ws_on_close(ws, code, reason):
     _debug_log(f"ws CLOSED code={code!r} reason={reason!r}")
 
-def _ws_run():
-    global _ws_app
-    backoff = 5
-    while not _ws_stop_flag.is_set():
+def _ws_run(gen):
+    """Connect-and-reconnect loop for one generation of the feed.
+
+    `gen` is this run's claim on the socket: _ws_start/_ws_stop bump the
+    global generation, so a run left over from an earlier stop retires at its
+    next check instead of lingering or fighting over _ws_app.
+    """
+    global _ws_app, _ws_running
+    backoff = WS_BACKOFF_MIN_S
+    while True:
+        with _ws_lock:
+            if gen != _ws_gen or _ws_stop_flag.is_set():
+                break
+        started = time.monotonic()
         try:
-            _ws_app = websocket.WebSocketApp(
-                "wss://mempool.space/api/v1/ws",
+            app = websocket.WebSocketApp(
+                WS_URL,
                 on_open    = _ws_on_open,
                 on_message = _ws_on_message,
                 on_error   = _ws_on_error,
                 on_close   = _ws_on_close,
             )
-            _ws_app.run_forever(ping_interval=25, ping_timeout=10)
+            with _ws_lock:
+                if gen != _ws_gen:
+                    break
+                _ws_app = app
+            app.run_forever(ping_interval=25, ping_timeout=10)
         except Exception as e:
             _debug_log(f"ws run_forever crash: {type(e).__name__}: {e}")
-        if _ws_stop_flag.is_set():
-            break
-        _debug_log(f"ws disconnected; retry in {backoff}s")
+        up = time.monotonic() - started
+        with _ws_lock:
+            if gen != _ws_gen or _ws_stop_flag.is_set():
+                break
+        # A connection that stayed up is evidence the network is healthy, so
+        # the next drop retries promptly. Without this the backoff only ever
+        # grew, and a few suspend/resume cycles left every later reconnect
+        # waiting the full 60s for the rest of the session.
+        if up >= WS_STABLE_S:
+            backoff = WS_BACKOFF_MIN_S
+        _debug_log(f"ws disconnected after {up:.0f}s; retry in {backoff}s")
         _ws_stop_flag.wait(backoff)
-        backoff = min(backoff * 2, 60)
+        backoff = min(backoff * 2, WS_BACKOFF_MAX_S)
+
+    with _ws_lock:
+        if gen == _ws_gen:
+            _ws_running = False
+            _ws_app = None
 
 def _ws_start():
-    global _ws_thread
-    if _ws_thread is not None and _ws_thread.is_alive():
-        return
-    _ws_stop_flag.clear()
-    _ws_thread = threading.Thread(target=_ws_run, daemon=True)
-    _ws_thread.start()
+    global _ws_thread, _ws_gen, _ws_running
+    with _ws_lock:
+        _ws_stop_flag.clear()
+        if _ws_running and _ws_thread is not None and _ws_thread.is_alive():
+            return
+        # Retire any run still winding down from a previous _ws_stop(). The
+        # old is_alive() check alone let a stop-then-start (toggling a WS tile
+        # off and straight back on) return early against a thread that was
+        # about to exit, leaving the feed dead until the app restarted.
+        _ws_gen += 1
+        gen = _ws_gen
+        _ws_running = True
+        _ws_thread = threading.Thread(target=_ws_run, args=(gen,), daemon=True)
+        _ws_thread.start()
+    _debug_log("ws start requested")
 
 def _ws_stop():
-    _ws_stop_flag.set()
-    if _ws_app is not None:
+    global _ws_gen, _ws_running, _ws_app
+    with _ws_lock:
+        _ws_gen += 1
+        _ws_running = False
+        _ws_stop_flag.set()
+        app, _ws_app = _ws_app, None
+    if app is not None:
         try:
-            _ws_app.close()
+            app.close()
         except Exception:
             pass
+    _debug_log("ws stop requested")
 
 def fetch_price(currency: str = "USD") -> str | None:
     gecko_id = CURRENCY_TO_GECKO.get(currency, "usd")
@@ -875,6 +1045,7 @@ class Tickoshi(tk.Tk):
             self.bind_all("<Control-Button-1>", self._show_menu)
         self._bind_children()
 
+        _log_startup_env()
         self._start_result_poller()
         self._fetch_loop()
 
@@ -1154,6 +1325,8 @@ class Tickoshi(tk.Tk):
         return f"{days:,}" if isinstance(days, int) else "--"
 
     def _compute_hash_str(self) -> str:
+        # Unlike fees/mempool this has an HTTP fallback polled on the user's
+        # own refresh interval, so it is not gated on the WebSocket being live.
         with _price_cache_lock:
             ehs = _network_cache.get("hashrate_ehs")
         if not isinstance(ehs, (int, float)) or ehs <= 0:
@@ -1163,7 +1336,7 @@ class Tickoshi(tk.Tk):
     def _compute_mempool_str(self) -> str:
         with _price_cache_lock:
             mb = _network_cache.get("mempool_mb")
-        if not isinstance(mb, (int, float)) or mb < 0:
+        if not _ws_feed_is_live() or not isinstance(mb, (int, float)) or mb < 0:
             return "--"
         return f"{mb:,.0f}" if mb >= 100 else f"{mb:,.1f}"
 
@@ -1262,10 +1435,15 @@ class Tickoshi(tk.Tk):
 
         # Secondary row updates (each runs only if its module is enabled).
         if self._fee_panels:
+            # Fees only arrive over the WebSocket. If that feed has gone quiet,
+            # blank the tile rather than leave a stale estimate looking live.
             with _price_cache_lock:
-                vals = (_fees_cache.get("low"),
-                        _fees_cache.get("med"),
-                        _fees_cache.get("high"))
+                if _ws_feed_is_live():
+                    vals = (_fees_cache.get("low"),
+                            _fees_cache.get("med"),
+                            _fees_cache.get("high"))
+                else:
+                    vals = (None, None, None)
             for panel, v in zip(self._fee_panels, vals):
                 panel.set_value(v)
         self._update_secondary_panels()
@@ -1315,13 +1493,17 @@ class Tickoshi(tk.Tk):
         needs_height = ("height" in modules) or ("halving" in modules)
 
         def _worker():
-            _fetch_all_prices()
+            refreshed = _fetch_all_prices(currency)
             if needs_height:
                 _fetch_block_height()
             if "hash" in modules:
                 _fetch_hashrate()
             # Fees + mempool are pushed via WebSocket — no HTTP fetch needed.
             display = fetch_price(currency)
+            if not refreshed:
+                _debug_log(f"fetch cycle: no live {currency} price from any "
+                           f"source (showing "
+                           f"{'last known' if display else 'nothing'})")
             self._result_queue.put(
                 lambda: self._on_fetch_done(display, currency, modules, gen))
 

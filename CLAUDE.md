@@ -29,7 +29,7 @@ Network I/O runs on background threads and hands results to the Tk main loop via
 - Price: CoinGecko primary, Binance fallback (`_fetch_all_prices`). Polled on the user's refresh interval (1/5/15/30/60 min; `REFRESH_OPTIONS`).
 - Block height: `blockchain.info` (`_fetch_block_height`). Halving days are computed locally against `NEXT_HALVING_BLOCK = 1_050_000`.
 - Hashrate: mempool.space mining REST endpoint (`_fetch_hashrate`).
-- Fees + mempool size: persistent WebSocket to `wss://mempool.space/api/v1/ws` via `websocket-client`. Lifecycle is managed by the module-level `_ws_start` / `_ws_stop` / `_ws_run` and the `_ws_on_*` callbacks — the WS reconnects on its own and pushes updates independent of the poll interval.
+- Fees + mempool size: persistent WebSocket to `wss://mempool.space/api/v1/ws` via `websocket-client`. Lifecycle is managed by the module-level `_ws_start` / `_ws_stop` / `_ws_run` and the `_ws_on_*` callbacks — the WS reconnects on its own and pushes updates independent of the poll interval. `_ws_run` takes a generation token so a run winding down from an earlier `_ws_stop()` retires instead of blocking a restart; reconnect backoff resets after a connection stays up `WS_STABLE_S`. These two tiles have no HTTP fallback, so they blank to `--` once the socket has been silent for `STALE_AFTER_S` rather than showing a dead feed's last reading as live.
 
 When adding a new data source, follow the same pattern: fetch on a worker thread, push into the queue, render on the Tk tick.
 
@@ -42,7 +42,9 @@ Settings autosave on every change to a JSON file next to a rolling 200-line debu
 - macOS: `~/Library/Application Support/Tickoshi/` (same filenames)
 - Linux: `~/.config/Tickoshi/` (same filenames)
 
-`config_path()` resolves the platform-specific location. The debug log is primarily for diagnosing the WebSocket feed.
+`config_path()` resolves the platform-specific location. The debug log is the tool for diagnosing connectivity: every session opens with a `--- Tickoshi start` line (python/platform/websocket-client versions, CA-store size, which proxy env vars are set), and each network failure logs its HTTP status plus the server's error body, or the transport exception. Because the window is only 200 lines, per-message value logging is deduplicated — a repeated fee/mempool/hashrate value logs once, so connection errors are not scrolled away. Keep new log lines quiet on success for the same reason.
+
+All HTTP fetches go through `_http_get()`, which centralizes the User-Agent, timeout, and that failure logging.
 
 ### Packaging note
 `BUILD.bat` / `BUILD.sh` / `BUILD.command` aggressively exclude heavy stdlib/third-party modules (numpy, pandas, matplotlib, smtplib, http.server, etc.) to keep the onefile binary small. If you add an import that transitively pulls one of these in, update the exclude list in all three scripts or the build will ship a much larger binary.
