@@ -313,8 +313,18 @@ _ws_alive_ts = None   # time of the last message accepted from the WebSocket
 # cycle showed fee/mempool numbers a whole refresh interval out of date.
 _ws_repaint = threading.Event()
 
+# gecko id -> when the mempool.space socket last pushed that rate. The socket
+# is already open for the fee tile, so these cost nothing, and they arrive
+# from the same host — which matters on networks that intercept the dedicated
+# price APIs but not mempool.space.
+_price_ws_ts = {}
+PRICE_WS_FRESH_S = 120
+
+def _is_recent(ts, window_s) -> bool:
+    return isinstance(ts, (int, float)) and (time.time() - ts) < window_s
+
 def _is_fresh(ts) -> bool:
-    return isinstance(ts, (int, float)) and (time.time() - ts) < STALE_AFTER_S
+    return _is_recent(ts, STALE_AFTER_S)
 
 def _ws_feed_is_live() -> bool:
     return _is_fresh(_ws_alive_ts)
@@ -369,6 +379,28 @@ def _prices_coingecko():
         # A 200 whose body carries no usable quote still means no price, so it
         # has to fall through to the next source rather than count as success.
         _debug_log(f"http price (coingecko) no usable quotes: {body[:160]}")
+    return out
+
+def _prices_mempool():
+    """mempool.space quotes fiat too, and this app already depends on that host
+    for fees and hashrate. Worth its own tier: a network that blocks the
+    dedicated price APIs often leaves this one reachable.
+    Shape: {"time": <unix>, "USD": 93000, "EUR": ..., ...} — top-level codes."""
+    body, _ = _http_get("https://mempool.space/api/v1/prices", timeout=8,
+                        what="price (mempool.space)")
+    if body is None:
+        return {}
+    try:
+        data = json.loads(body)
+    except Exception as e:
+        _debug_log(f"http price (mempool.space) bad body: "
+                   f"{type(e).__name__}: {e}")
+        return {}
+    out = {}
+    for code, _, gid in CURRENCIES:
+        v = data.get(code) if isinstance(data, dict) else None
+        if isinstance(v, (int, float)) and v > 0:
+            out[gid] = float(v)
     return out
 
 def _prices_blockchain_info():
@@ -450,7 +482,8 @@ def _prices_binance(preferred=None):
 
 # Tried in order until the currency on screen has a quote. All keyless. The
 # first three each cover every currency in a single request.
-_PRICE_SOURCES = (_prices_coingecko, _prices_blockchain_info, _prices_coinbase)
+_PRICE_SOURCES = (_prices_coingecko, _prices_mempool,
+                  _prices_blockchain_info, _prices_coinbase)
 
 def _fetch_all_prices(preferred: str | None = None):
     """Refresh the price cache from the first source that answers.
@@ -460,6 +493,16 @@ def _fetch_all_prices(preferred: str | None = None):
     success indefinitely after the network dropped.
     """
     pref_gid = CURRENCY_TO_GECKO.get(preferred)
+
+    # The open socket may already carry this rate. Taking it counts as a live
+    # refresh and skips the HTTP chain outright, which is the whole point on a
+    # network where those hosts are unreachable.
+    if pref_gid is not None:
+        with _price_cache_lock:
+            ts = _price_ws_ts.get(pref_gid)
+        if _is_recent(ts, PRICE_WS_FRESH_S):
+            return True
+
     stored = set()
 
     def store(quotes):
@@ -651,6 +694,26 @@ def _ws_on_message(ws, raw):
                 f"economy={fees.get('economyFee')!r}, minimum={fees.get('minimumFee')!r})  "
                 f"formatted=(HIGH={shown[0]!r}, MED={shown[1]!r}, LOW={shown[2]!r})"
             )
+
+    # Price — {"conversions": {"USD": 93000.0, "EUR": ..., "GBP", "JPY", ...}}.
+    # mempool.space does not quote every currency here (no TRY or RUB), so
+    # whatever it does send is taken and the rest fall through to HTTP.
+    conv = msg.get("conversions")
+    if isinstance(conv, dict):
+        got = {}
+        with _price_cache_lock:
+            for code, _, gid in CURRENCIES:
+                v = conv.get(code)
+                if isinstance(v, (int, float)) and v > 0:
+                    _price_cache[gid] = float(v)
+                    _price_ws_ts[gid] = time.time()
+                    got[code] = float(v)
+        if got:
+            _ws_repaint.set()
+            if _ws_logged.get("conversions") != got:
+                _ws_logged["conversions"] = got
+                _debug_log("ws prices  " + ", ".join(
+                    f"{c}={v:,.0f}" for c, v in got.items()))
 
     # Mempool size — {"mempoolInfo": {"bytes": <vBytes>, "size": <tx_count>, ...}}
     mi = msg.get("mempoolInfo")
