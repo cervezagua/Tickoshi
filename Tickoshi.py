@@ -320,33 +320,46 @@ def _is_fresh(ts) -> bool:
 def _ws_feed_is_live() -> bool:
     return _is_fresh(_ws_alive_ts)
 
-# Substrings of a TLS handshake that was answered with something that is not
-# TLS. OpenSSL and Windows' schannel word it differently for the same event.
-_TLS_INTERCEPT_MARKERS = ("WRONG_VERSION_NUMBER", "UNEXPECTED_MESSAGE",
-                          "record layer", "INVALID_TOKEN", "unexpected eof")
+# A handshake answered with something that is not TLS at all — the connection
+# was cut mid-handshake. OpenSSL and Windows' schannel word it differently.
+_TLS_KILLED_MARKERS = ("WRONG_VERSION_NUMBER", "UNEXPECTED_MESSAGE",
+                       "record layer", "INVALID_TOKEN", "unexpected eof")
+# A handshake that completed but presented a certificate this machine's trust
+# store rejects. Public CAs always set an Authority Key Identifier, so a chain
+# missing one was generated locally: something is re-signing HTTPS traffic.
+_TLS_RESIGNED_MARKERS = ("Missing Authority Key Identifier",
+                         "self signed certificate in certificate chain",
+                         "unable to get local issuer certificate")
 _tls_hint_logged = False
 
 def _note_if_intercepted(exc):
-    """Explain a handshake that got non-TLS bytes back, once per session.
+    """Say once per session when a TLS failure looks like filtering.
 
-    Worth spelling out because the obvious suspect is wrong. A local firewall
-    denies the socket outright (WinError 10013 on Windows) and never reaches a
-    handshake; DNS interception shows up as an unexpected address. Getting a
-    malformed handshake back from the correct address means something in the
-    network path is matching on the hostname in the ClientHello, which no
-    setting in this app can route around.
+    Both shapes below mean something is inspecting HTTPS rather than the site
+    being down, and neither is a plain firewall — that denies the socket
+    outright (WinError 10013 on Windows) and never reaches a handshake.
+    Filtering software on the machine is the first thing to check because it
+    is the case the user can actually fix.
     """
     global _tls_hint_logged
     if _tls_hint_logged:
         return
-    if not any(m in str(exc) for m in _TLS_INTERCEPT_MARKERS):
-        return
-    _tls_hint_logged = True
-    _debug_log("note: handshake answered with non-TLS bytes. If the dns lines "
-               "above look normal and other hosts work, this host is being "
-               "filtered by name in the network path — not by a local "
-               "firewall (that denies the socket instead). Needs a VPN, a "
-               "proxy, or a different network.")
+    text = str(exc)
+    if any(m in text for m in _TLS_RESIGNED_MARKERS):
+        _tls_hint_logged = True
+        _debug_log("note: the certificate was signed locally, not by the "
+                   "site's real CA — HTTPS-filtering software on this machine "
+                   "(AdGuard, an antivirus with HTTPS scanning, a corporate "
+                   "proxy) is re-signing traffic. Exclude this app or these "
+                   "hosts in it, or turn its HTTPS filtering off.")
+    elif any(m in text for m in _TLS_KILLED_MARKERS):
+        _tls_hint_logged = True
+        _debug_log("note: handshake answered with non-TLS bytes, i.e. cut "
+                   "mid-handshake. If the dns lines above look normal, check "
+                   "HTTPS-filtering software on this machine first (AdGuard "
+                   "and similar block by domain and affect every app, so test "
+                   "with it paused); otherwise the filtering is upstream and "
+                   "needs a VPN or another network.")
 
 def _http_get(url, timeout=8, what=""):
     """GET `url`, returning `(body, status)`.
