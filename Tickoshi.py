@@ -354,12 +354,13 @@ def _note_if_intercepted(exc):
                    "hosts in it, or turn its HTTPS filtering off.")
     elif any(m in text for m in _TLS_KILLED_MARKERS):
         _tls_hint_logged = True
-        _debug_log("note: handshake answered with non-TLS bytes, i.e. cut "
-                   "mid-handshake. If the dns lines above look normal, check "
-                   "HTTPS-filtering software on this machine first (AdGuard "
-                   "and similar block by domain and affect every app, so test "
-                   "with it paused); otherwise the filtering is upstream and "
-                   "needs a VPN or another network.")
+        _debug_log("note: handshake cut mid-handshake — this host is being "
+                   "filtered by name, not refused or misresolved. To place it, "
+                   "retry on another network (phone hotspot) or a VPN: if it "
+                   "works there the filtering is upstream and no setting here "
+                   "can avoid it; if it fails there too it is HTTPS-filtering "
+                   "software on this machine (AdGuard, antivirus HTTPS "
+                   "scanning) and these hosts need excluding in it.")
 
 def _http_get(url, timeout=8, what=""):
     """GET `url`, returning `(body, status)`.
