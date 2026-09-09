@@ -26,10 +26,10 @@ The top-level `Tickoshi(tk.Tk)` class owns layout, the right-click menu, config 
 
 ### Data sources and threading
 Network I/O runs on background threads and hands results to the Tk main loop via a `queue.Queue` polled on the Tk timer — never touch Tk widgets from a worker thread.
-- Price: CoinGecko primary, Binance fallback (`_fetch_all_prices`). Polled on the user's refresh interval (1/5/15/30/60 min; `REFRESH_OPTIONS`).
+- Price: CoinGecko primary, Binance fallback (`_fetch_all_prices`). Polled on the user's refresh interval (1/5/15/30/60 min; `REFRESH_OPTIONS`). The CoinGecko call also carries `include_24hr_change=true`, so the 24h move for every currency arrives in the same request — Binance has no equivalent, so the 24h tile reads `--` whenever the fallback supplied the price.
 - Block height: `blockchain.info` (`_fetch_block_height`). Halving days are computed locally against `NEXT_HALVING_BLOCK = 1_050_000`.
 - Hashrate: mempool.space mining REST endpoint (`_fetch_hashrate`).
-- Fees + mempool size: persistent WebSocket to `wss://mempool.space/api/v1/ws` via `websocket-client`. Lifecycle is managed by the module-level `_ws_start` / `_ws_stop` / `_ws_run` and the `_ws_on_*` callbacks — the WS reconnects on its own and pushes updates independent of the poll interval.
+- Fees, mempool size, difficulty retarget and block height/age: one persistent WebSocket to `wss://mempool.space/api/v1/ws` via `websocket-client`. The socket pushes more than the app once read — `da` carries `difficultyChange`/`remainingBlocks` beside the hashrate, and `blocks` (an array on connect) plus `block` (one per new block) carry height and timestamp. Height from the socket lands the moment a block is mined; `_fetch_block_height` stays as the HTTP fallback and never rolls the height backwards. Lifecycle is managed by the module-level `_ws_start` / `_ws_stop` / `_ws_run` and the `_ws_on_*` callbacks — the WS reconnects on its own and pushes updates independent of the poll interval.
 
 When adding a new data source, follow the same pattern: fetch on a worker thread, push into the queue, render on the Tk tick.
 
@@ -43,6 +43,9 @@ Settings autosave on every change to a JSON file next to a rolling 200-line debu
 - Linux: `~/.config/Tickoshi/` (same filenames)
 
 `config_path()` resolves the platform-specific location. The debug log is primarily for diagnosing the WebSocket feed.
+
+### Live tile tick
+`_start_live_tick` repaints the secondary tiles once a second. The block-age counter has to advance with no new data to prompt it, and `set_value()` is a no-op unless the rendered text changed, so this costs a few string comparisons per second. It also keeps socket-fed tiles current instead of leaving them until the next price cycle, which on a 60-minute interval is an hour away.
 
 ### Packaging note
 `BUILD.bat` / `BUILD.sh` / `BUILD.command` aggressively exclude heavy stdlib/third-party modules (numpy, pandas, matplotlib, smtplib, http.server, etc.) to keep the onefile binary small. If you add an import that transitively pulls one of these in, update the exclude list in all three scripts or the build will ship a much larger binary.

@@ -76,12 +76,15 @@ CURRENCY_SIGNS = {
 
 # Secondary-row modules (key, menu label). Primary row always shows Price.
 MODULES = [
-    ("fees",    "Fees"),
-    ("sats",    "Sats"),
-    ("height",  "Block Height"),
-    ("halving", "Halving"),
-    ("hash",    "Hashrate"),
-    ("mempool", "Mempool"),
+    ("fees",     "Fees"),
+    ("sats",     "Sats"),
+    ("change",   "24h Change"),
+    ("height",   "Block Height"),
+    ("blockage", "Block Age"),
+    ("halving",  "Halving"),
+    ("diff",     "Difficulty"),
+    ("hash",     "Hashrate"),
+    ("mempool",  "Mempool"),
 ]
 MODULE_KEYS = {k for k, _ in MODULES}
 
@@ -283,21 +286,35 @@ class FlipCard(tk.Frame):
 _price_cache = {}
 _block_height_cache = {"height": None}
 _fees_cache = {"low": None, "med": None, "high": None}
-_network_cache = {"hashrate_ehs": None, "mempool_mb": None}
+_network_cache = {"hashrate_ehs": None, "mempool_mb": None,
+                  # Difficulty retarget, from the WS "da" object.
+                  "diff_change_pct": None, "diff_blocks_left": None,
+                  # Newest block seen, for the block-age counter.
+                  "block_ts": None}
+# 24h price move per currency, keyed by CoinGecko id like _price_cache.
+_change_cache = {}
 _price_cache_lock = threading.Lock()
 
 def _fetch_all_prices():
     gecko_ids = ",".join(gid for _, _, gid in CURRENCIES)
     primary_ok = False
     try:
-        url = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=" + gecko_ids
+        # include_24hr_change rides along on the existing request — the 24h
+        # move costs no extra call, and Binance has no equivalent here, so the
+        # tile falls back to "--" whenever the fallback supplied the price.
+        url = ("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin"
+               "&include_24hr_change=true&vs_currencies=" + gecko_ids)
         req = urllib.request.Request(url, headers={"User-Agent": "Tickoshi/1.0"})
         with urllib.request.urlopen(req, timeout=8) as r:
             data = json.loads(r.read().decode())
+        quotes = data.get("bitcoin", {})
         with _price_cache_lock:
             for _, _, gid in CURRENCIES:
-                if gid in data.get("bitcoin", {}):
-                    _price_cache[gid] = float(data["bitcoin"][gid])
+                if gid in quotes:
+                    _price_cache[gid] = float(quotes[gid])
+                chg = quotes.get(f"{gid}_24h_change")
+                if isinstance(chg, (int, float)):
+                    _change_cache[gid] = float(chg)
         primary_ok = True
     except Exception as e:
         _debug_log(f"http price fetch failed (coingecko): {type(e).__name__}: {e}")
@@ -443,7 +460,9 @@ def _ws_on_message(ws, raw):
                 _network_cache["mempool_mb"] = vbytes / 1_000_000.0
             _debug_log(f"ws mempool  bytes={vbytes} -> {_network_cache['mempool_mb']:.2f} MB")
 
-    # Hashrate — live field from difficulty-adjustment block: {"da": {"currentHashrate": <H/s>, ...}}
+    # Difficulty adjustment — {"da": {"currentHashrate", "difficultyChange",
+    # "remainingBlocks", ...}}. The hashrate tile already parsed this object;
+    # the retarget fields were arriving and being thrown away.
     da = msg.get("da")
     if isinstance(da, dict):
         hr = da.get("currentHashrate")
@@ -451,6 +470,39 @@ def _ws_on_message(ws, raw):
             with _price_cache_lock:
                 _network_cache["hashrate_ehs"] = hr / 1e18
             _debug_log(f"ws hashrate  H/s={hr} -> {_network_cache['hashrate_ehs']:.2f} EH/s")
+        chg  = da.get("difficultyChange")
+        left = da.get("remainingBlocks")
+        with _price_cache_lock:
+            if isinstance(chg, (int, float)):
+                _network_cache["diff_change_pct"] = float(chg)
+            if isinstance(left, (int, float)) and left >= 0:
+                _network_cache["diff_blocks_left"] = int(left)
+
+    # Blocks — the socket sends an array on connect and a single object for
+    # each new block. Both carry height and a unix timestamp, which gives the
+    # block-age counter and a height that lands the moment a block is mined
+    # rather than on the next HTTP poll.
+    found = []
+    blks = msg.get("blocks")
+    if isinstance(blks, list):
+        found.extend(b for b in blks if isinstance(b, dict))
+    blk = msg.get("block")
+    if isinstance(blk, dict):
+        found.append(blk)
+    newest = None
+    for b in found:
+        h = b.get("height")
+        if isinstance(h, int) and (newest is None or h > newest.get("height", -1)):
+            newest = b
+    if newest is not None:
+        h  = newest.get("height")
+        ts = newest.get("timestamp")
+        with _price_cache_lock:
+            if isinstance(ts, (int, float)) and ts > 0:
+                _network_cache["block_ts"] = float(ts)
+            if isinstance(h, int) and h > (_block_height_cache.get("height") or 0):
+                _block_height_cache["height"] = h
+                _debug_log(f"ws block  height={h}")
 
     # Hashrate fallback — init payload carries a "hashrates" array of historical points.
     hrs = msg.get("hashrates")
@@ -876,6 +928,7 @@ class Tickoshi(tk.Tk):
         self._bind_children()
 
         self._start_result_poller()
+        self._start_live_tick()
         self._fetch_loop()
 
         # Start mempool.space WS if any WS-fed module is enabled at startup.
@@ -1058,6 +1111,9 @@ class Tickoshi(tk.Tk):
         self._halving_panel = None
         self._hash_panel = None
         self._mempool_panel = None
+        self._change_panel = None
+        self._diff_panel = None
+        self._blockage_panel = None
 
         def _new_row():
             r = tk.Frame(container, bg=C_FACE)
@@ -1083,11 +1139,14 @@ class Tickoshi(tk.Tk):
         def _build_single_tile(parent, key, width, right_pad):
             sign = CURRENCY_SIGNS.get(self._currency, "$")
             spec = {
-                "sats":    ("SATS",   f"per {sign}"),
-                "height":  ("HEIGHT", "blk"),
-                "halving": ("HALVING", "days"),
-                "hash":    ("HASH",   "EH/s"),
-                "mempool": ("MEMP",   "MB"),
+                "sats":     ("SATS",   f"per {sign}"),
+                "change":   ("24H",    "%"),
+                "height":   ("HEIGHT", "blk"),
+                "blockage": ("BLOCK",  "ago"),
+                "halving":  ("HALVING", "days"),
+                "diff":     ("DIFF",   "%"),
+                "hash":     ("HASH",   "EH/s"),
+                "mempool":  ("MEMP",   "MB"),
             }[key]
             fb = FeeBlock(parent, total_w=width, scale=s,
                           label=spec[0], unit=spec[1],
@@ -1096,7 +1155,8 @@ class Tickoshi(tk.Tk):
             fb.pack(side="left", padx=(0, right_pad))
             attr = {"sats": "_sats_panel", "height": "_height_panel",
                     "halving": "_halving_panel", "hash": "_hash_panel",
-                    "mempool": "_mempool_panel"}[key]
+                    "mempool": "_mempool_panel", "change": "_change_panel",
+                    "diff": "_diff_panel", "blockage": "_blockage_panel"}[key]
             setattr(self, attr, fb)
 
         # Walk modules in selection order. Pair adjacent non-fees tiles into
@@ -1160,6 +1220,40 @@ class Tickoshi(tk.Tk):
             return "--"
         return f"{ehs:,.0f}" if ehs >= 100 else f"{ehs:,.1f}"
 
+    def _compute_change_str(self) -> str:
+        """24h move as a signed percentage. Only CoinGecko supplies this, so it
+        reads "--" whenever the Binance fallback provided the price."""
+        gecko_id = CURRENCY_TO_GECKO.get(self._currency, "usd")
+        with _price_cache_lock:
+            pct = _change_cache.get(gecko_id)
+        if not isinstance(pct, (int, float)):
+            return "--"
+        return f"{pct:+.1f}"
+
+    def _compute_diff_str(self) -> str:
+        """Projected change at the next retarget, signed."""
+        with _price_cache_lock:
+            pct = _network_cache.get("diff_change_pct")
+        if not isinstance(pct, (int, float)):
+            return "--"
+        return f"{pct:+.1f}"
+
+    def _compute_blockage_str(self) -> str:
+        """Time since the newest block. Recomputed every second from a stored
+        timestamp, so it ticks without needing anything from the network."""
+        with _price_cache_lock:
+            ts = _network_cache.get("block_ts")
+        if not isinstance(ts, (int, float)) or ts <= 0:
+            return "--"
+        secs = int(time.time() - ts)
+        if secs < 0:
+            secs = 0          # a block timestamp may sit slightly in the future
+        if secs < 60:
+            return f"{secs}s"
+        if secs < 3600:
+            return f"{secs // 60}m"
+        return f"{secs // 3600}h{(secs % 3600) // 60:02d}m"
+
     def _compute_mempool_str(self) -> str:
         with _price_cache_lock:
             mb = _network_cache.get("mempool_mb")
@@ -1178,6 +1272,12 @@ class Tickoshi(tk.Tk):
             self._hash_panel.set_value(self._compute_hash_str())
         if self._mempool_panel is not None:
             self._mempool_panel.set_value(self._compute_mempool_str())
+        if self._change_panel is not None:
+            self._change_panel.set_value(self._compute_change_str())
+        if self._diff_panel is not None:
+            self._diff_panel.set_value(self._compute_diff_str())
+        if self._blockage_panel is not None:
+            self._blockage_panel.set_value(self._compute_blockage_str())
 
     # ── Border pulse animation ────────────────────────────────────────────────
     def _pulse(self, color):
@@ -1293,6 +1393,32 @@ class Tickoshi(tk.Tk):
             if self.winfo_exists():
                 self.after(50, _poll)
         self.after(50, _poll)
+
+    def _start_live_tick(self):
+        """Repaint the secondary tiles once a second.
+
+        The block-age counter has to advance on its own, with no new data to
+        prompt it. set_value() is a no-op unless the rendered text actually
+        changed, so this costs a few string comparisons per second — and it
+        also keeps the socket-fed tiles current instead of leaving them until
+        the next price cycle, which on a 60-minute interval is an hour away.
+        """
+        self._tick_error_logged = False
+
+        def _tick():
+            if not self.winfo_exists():
+                return
+            try:
+                self._update_secondary_panels()
+            except Exception as e:
+                # Cosmetic, and it must not stop the timer or flood a 200-line
+                # log at one line a second, so say it once and carry on.
+                if not self._tick_error_logged:
+                    self._tick_error_logged = True
+                    _debug_log(f"tile tick failed: {type(e).__name__}: {e}")
+            self.after(1000, _tick)
+
+        self.after(1000, _tick)
 
     def _fetch_loop(self):
         # Cancel any pending next-tick timer so we don't stack loops.
