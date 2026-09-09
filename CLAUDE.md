@@ -38,22 +38,5 @@ When adding a new data source, follow the same pattern: fetch on a worker thread
 ### Start at login
 `autostart_enabled()` / `set_autostart()` register the app for login: a `Run` registry value on Windows, a LaunchAgent plist on macOS, an autostart `.desktop` on Linux. The state is read back from the OS every time the menu opens rather than mirrored into our config, so an entry removed behind the app's back shows as off. `_launch_command()` returns the executable alone when frozen (PyInstaller sets `sys.frozen`) and interpreter-plus-script otherwise.
 
-### Price alert
-One-shot by design. `_arm_alert` captures the direction by comparing the target to the price on screen, so "alert me at 120k" means above when currently below and below when currently above — no direction picker. `_check_price_alert` runs on every price update, fires once (bell plus an amber border pulse, distinct from the green/red move flashes) and disarms, because a widget that beeps every refresh while the price sits past the line gets switched off. `parse_price_input` accepts grouping separators and a currency symbol, and is also what validates the value loaded from config, so a corrupt entry cannot break startup.
-
-### Secondary tiles ("modules")
-Optional tiles are declared in the `MODULES` list (`key`, menu label). Enabled keys are stored in config as `modules`, rendered in the order the user toggled them on, and auto-paired two-per-row when both fit. Adding a tile means: append to `MODULES`, add a data fetch (or WS handler), and add a render branch in the layout code in `Tickoshi`.
-
-### Config and logs
-Settings autosave on every change to a JSON file next to a rolling 200-line debug log (`_debug_log`):
-- Windows: `%APPDATA%\Tickoshi\tickoshi_config.json` / `tickoshi_debug.log`
-- macOS: `~/Library/Application Support/Tickoshi/` (same filenames)
-- Linux: `~/.config/Tickoshi/` (same filenames)
-
-`config_path()` resolves the platform-specific location. The debug log is primarily for diagnosing the WebSocket feed. Because the window is only 200 lines, per-message value logging is deduplicated via `_ws_logged` — a repeated fee/mempool/hashrate value logs once. Without that, fee pushes filled the whole window in about two minutes and scrolled every connection error out of it. Keep new log lines quiet on success for the same reason.
-
-### Live tile tick
-`_start_live_tick` repaints the secondary tiles once a second. The block-age counter has to advance with no new data to prompt it, and `set_value()` is a no-op unless the rendered text changed, so this costs a few string comparisons per second. It also keeps socket-fed tiles current instead of leaving them until the next price cycle, which on a 60-minute interval is an hour away.
-
 ### Packaging note
 `BUILD.bat` / `BUILD.sh` / `BUILD.command` aggressively exclude heavy stdlib/third-party modules (numpy, pandas, matplotlib, smtplib, http.server, etc.) to keep the onefile binary small. If you add an import that transitively pulls one of these in, update the exclude list in all three scripts or the build will ship a much larger binary.

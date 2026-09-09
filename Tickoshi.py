@@ -515,24 +515,6 @@ def _fetch_block_height():
     except Exception:
         return _block_height_cache.get("height")
 
-def parse_price_input(text):
-    """Read a price a person typed. Accepts grouping separators and a currency
-    symbol, so "$ 120,000" and "120000" both work. Returns None if it is not a
-    usable positive number rather than raising at the caller."""
-    if text is None:
-        return None
-    cleaned = "".join(ch for ch in str(text) if ch.isdigit() or ch in ".,")
-    # Treat "," as grouping and "." as the decimal point. A lone comma used as
-    # a decimal separator ("1234,5") still parses because it is dropped.
-    cleaned = cleaned.replace(",", "")
-    if cleaned.count(".") > 1:
-        return None
-    try:
-        v = float(cleaned)
-    except (TypeError, ValueError):
-        return None
-    return v if v > 0 else None
-
 def _fmt_signed_pct(v):
     """Signed percentage for the 24h and difficulty tiles.
 
@@ -1135,11 +1117,6 @@ class Tickoshi(tk.Tk):
         self._border_color = self._cfg.get("border_color", "Gold")
         self._flash_enabled = self._cfg.get("flash", True)
         self._locked = self._cfg.get("locked", False)
-        # Price alert: a target and the direction it must be crossed from,
-        # captured when armed so a restart cannot silently flip the meaning.
-        self._alert_price = parse_price_input(self._cfg.get("alert_price"))
-        self._alert_above = bool(self._cfg.get("alert_above", True))
-        self._alert_win = None
         self._drag  = None
         self._last_price_str = None
         self._last_display_str = None
@@ -1244,8 +1221,6 @@ class Tickoshi(tk.Tk):
         self._cfg["border_color"] = self._border_color
         self._cfg["flash"]        = self._flash_enabled
         self._cfg["locked"]       = self._locked
-        self._cfg["alert_price"]  = self._alert_price
-        self._cfg["alert_above"]  = self._alert_above
         path = config_path()
         tmp = path + ".tmp"
         try:
@@ -1590,23 +1565,18 @@ class Tickoshi(tk.Tk):
             for dp in self._digit_panels:
                 dp.set("-")
         else:
-            try:
-                new_val = int(display_str)
-            except ValueError:
-                new_val = None
-
             # Flash check (primary display is always price now)
-            if new_val is not None and self._flash_enabled:
-                if self._prev_price is not None:
-                    if new_val > self._prev_price:
-                        self._pulse("#18c558")            # green = up
-                    elif new_val < self._prev_price:
-                        self._pulse("#e63b3b")            # red = down
-            if new_val is not None:
-                # Tracked regardless of the flash setting: the alert must not
-                # depend on an unrelated cosmetic toggle.
-                self._prev_price = new_val
-                self._check_price_alert(new_val)
+            if self._flash_enabled:
+                try:
+                    new_val = int(display_str)
+                    if self._prev_price is not None:
+                        if new_val > self._prev_price:
+                            self._pulse("#18c558")        # green = up
+                        elif new_val < self._prev_price:
+                            self._pulse("#e63b3b")        # red = down
+                    self._prev_price = new_val
+                except ValueError:
+                    pass
 
             self._last_display_str = display_str
             needed = min(max(len(display_str), 1), MAX_DIGITS)
@@ -1891,13 +1861,6 @@ class Tickoshi(tk.Tk):
 
         # Read the OS every time the menu opens rather than trusting a stored
         # flag, so an entry removed behind our back shows as off.
-        if self._alert_price is not None:
-            arrow = "\u25b2" if self._alert_above else "\u25bc"
-            alert_label = f"  Price alert: {self._alert_price:,.0f} {arrow}"
-        else:
-            alert_label = "  Price alert\u2026"
-        menu.add_command(label=alert_label, command=self._menu_price_alert)
-
         auto_check = " \u2713" if autostart_enabled() else ""
         menu.add_command(label=f"  Start at login{auto_check}",
                          command=self._menu_toggle_autostart)
@@ -1999,115 +1962,6 @@ class Tickoshi(tk.Tk):
     def _menu_toggle_flash(self):
         self._flash_enabled = not self._flash_enabled
         self._save_config()
-
-    # ── Price alert ───────────────────────────────────────────────────────────
-    def _arm_alert(self, target):
-        """Arm at `target`. The direction is decided here, against the price on
-        screen, so "alert me at 120k" means above when we are below it and
-        below when we are above it — no direction picker needed."""
-        current = None
-        try:
-            current = int(self._last_display_str) if self._last_display_str else None
-        except (TypeError, ValueError):
-            current = None
-        self._alert_price = target
-        self._alert_above = (current is None) or (target >= current)
-        self._save_config()
-        _debug_log(f"price alert armed at {target:,.0f} "
-                   f"({'rise above' if self._alert_above else 'fall below'}; "
-                   f"now {current if current is not None else '?'})")
-
-    def _clear_alert(self):
-        if self._alert_price is None:
-            return
-        _debug_log("price alert cleared")
-        self._alert_price = None
-        self._save_config()
-
-    def _check_price_alert(self, value):
-        """Fire once when the target is crossed, then disarm.
-
-        One-shot on purpose: a widget that beeps every refresh while the price
-        sits above the line would be turned off within a minute.
-        """
-        target = self._alert_price
-        if target is None or not isinstance(value, (int, float)):
-            return
-        hit = value >= target if self._alert_above else value <= target
-        if not hit:
-            return
-        self._alert_price = None
-        self._save_config()
-        _debug_log(f"price alert FIRED: {value:,} "
-                   f"{'>=' if self._alert_above else '<='} {target:,.0f}")
-        try:
-            self.bell()
-        except Exception:
-            pass
-        self._pulse("#ffd24a")      # amber — distinct from the up/down flashes
-
-    def _menu_price_alert(self):
-        self.after(30, self._open_alert_dialog)
-
-    def _open_alert_dialog(self):
-        if self._alert_win is not None and self._alert_win.winfo_exists():
-            self._alert_win.lift()
-            return
-        win = tk.Toplevel(self)
-        self._alert_win = win
-        win.title(f"{APP_NAME} — price alert")
-        win.configure(bg=C_FACE)
-        win.resizable(False, False)
-        win.transient(self)
-
-        sign = CURRENCY_SIGNS.get(self._currency, "$")
-        tk.Label(win, text=f"Alert when BTC reaches ({sign})",
-                 bg=C_FACE, fg=C_LABEL_TXT,
-                 font=(_FONT_FAMILY, 10)).pack(padx=14, pady=(12, 4))
-
-        entry = tk.Entry(win, width=16, justify="center",
-                         bg=C_PANEL_BG, fg=C_DIGIT, insertbackground=C_DIGIT,
-                         relief="flat", font=(_FONT_FAMILY, 14, "bold"))
-        entry.pack(padx=14)
-        if self._alert_price is not None:
-            entry.insert(0, f"{self._alert_price:,.0f}")
-        elif self._last_display_str:
-            entry.insert(0, self._last_display_str)
-        entry.select_range(0, "end")
-        entry.focus_set()
-
-        note = tk.Label(win, text="", bg=C_FACE, fg="#e63b3b",
-                        font=(_FONT_FAMILY, 9))
-        note.pack(padx=14, pady=(4, 0))
-
-        def do_set(_e=None):
-            target = parse_price_input(entry.get())
-            if target is None:
-                note.config(text="Enter a number above zero")
-                return
-            self._arm_alert(target)
-            close()
-
-        def do_clear():
-            self._clear_alert()
-            close()
-
-        def close(_e=None):
-            self._alert_win = None
-            win.destroy()
-
-        row = tk.Frame(win, bg=C_FACE)
-        row.pack(padx=14, pady=12)
-        for label, cmd in (("Set", do_set), ("Clear", do_clear),
-                           ("Cancel", close)):
-            tk.Button(row, text=label, command=cmd, relief="flat", bd=0,
-                      bg=C_PANEL_BG, fg=C_LABEL_TXT,
-                      activebackground=self._bc("hi"), activeforeground=C_FACE,
-                      font=(_FONT_FAMILY, 9, "bold"), width=7).pack(side="left",
-                                                                    padx=3)
-        win.bind("<Return>", do_set)
-        win.bind("<Escape>", close)
-        win.protocol("WM_DELETE_WINDOW", close)
 
     def _menu_toggle_autostart(self):
         want = not autostart_enabled()
