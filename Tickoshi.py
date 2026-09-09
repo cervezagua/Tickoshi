@@ -12,6 +12,7 @@ import os
 import sys
 import urllib.request
 import urllib.error
+import socket
 import time
 import websocket
 
@@ -313,18 +314,8 @@ _ws_alive_ts = None   # time of the last message accepted from the WebSocket
 # cycle showed fee/mempool numbers a whole refresh interval out of date.
 _ws_repaint = threading.Event()
 
-# gecko id -> when the mempool.space socket last pushed that rate. The socket
-# is already open for the fee tile, so these cost nothing, and they arrive
-# from the same host — which matters on networks that intercept the dedicated
-# price APIs but not mempool.space.
-_price_ws_ts = {}
-PRICE_WS_FRESH_S = 120
-
-def _is_recent(ts, window_s) -> bool:
-    return isinstance(ts, (int, float)) and (time.time() - ts) < window_s
-
 def _is_fresh(ts) -> bool:
-    return _is_recent(ts, STALE_AFTER_S)
+    return isinstance(ts, (int, float)) and (time.time() - ts) < STALE_AFTER_S
 
 def _ws_feed_is_live() -> bool:
     return _is_fresh(_ws_alive_ts)
@@ -381,78 +372,11 @@ def _prices_coingecko():
         _debug_log(f"http price (coingecko) no usable quotes: {body[:160]}")
     return out
 
-def _prices_mempool():
-    """mempool.space quotes fiat too, and this app already depends on that host
-    for fees and hashrate. Worth its own tier: a network that blocks the
-    dedicated price APIs often leaves this one reachable.
-    Shape: {"time": <unix>, "USD": 93000, "EUR": ..., ...} — top-level codes."""
-    body, _ = _http_get("https://mempool.space/api/v1/prices", timeout=8,
-                        what="price (mempool.space)")
-    if body is None:
-        return {}
-    try:
-        data = json.loads(body)
-    except Exception as e:
-        _debug_log(f"http price (mempool.space) bad body: "
-                   f"{type(e).__name__}: {e}")
-        return {}
-    out = {}
-    for code, _, gid in CURRENCIES:
-        v = data.get(code) if isinstance(data, dict) else None
-        if isinstance(v, (int, float)) and v > 0:
-            out[gid] = float(v)
-    return out
-
-def _prices_blockchain_info():
-    """https://blockchain.info/ticker — one keyless request, every currency,
-    and a host this app already depends on for block height.
-    Shape: {"USD": {"last": 93000.0, ...}, ...} with numeric values."""
-    body, _ = _http_get("https://blockchain.info/ticker", timeout=8,
-                        what="price (blockchain.info)")
-    if body is None:
-        return {}
-    try:
-        data = json.loads(body)
-    except Exception as e:
-        _debug_log(f"http price (blockchain.info) bad body: "
-                   f"{type(e).__name__}: {e}")
-        return {}
-    out = {}
-    for code, _, gid in CURRENCIES:
-        row = data.get(code) if isinstance(data, dict) else None
-        v = row.get("last") if isinstance(row, dict) else None
-        if isinstance(v, (int, float)) and v > 0:
-            out[gid] = float(v)
-    return out
-
-def _prices_coinbase():
-    """Coinbase exchange-rates — one keyless request, every currency, and not
-    geo-restricted. Rates arrive as STRINGS under data.rates.<CODE>."""
-    body, _ = _http_get(
-        "https://api.coinbase.com/v2/exchange-rates?currency=BTC",
-        timeout=8, what="price (coinbase)")
-    if body is None:
-        return {}
-    try:
-        rates = ((json.loads(body).get("data") or {}).get("rates")) or {}
-    except Exception as e:
-        _debug_log(f"http price (coinbase) bad body: {type(e).__name__}: {e}")
-        return {}
-    out = {}
-    for code, _, gid in CURRENCIES:
-        try:
-            v = float(rates[code])
-        except (KeyError, TypeError, ValueError):
-            continue
-        if v > 0:
-            out[gid] = v
-    return out
-
 def _prices_binance(preferred=None):
     """Per-symbol, so only the currency on screen is worth the round trip.
-    Last in the chain because Binance answers 451 to entire countries; that
-    status abandons the host outright rather than stalling the cycle on five
-    more symbols that will be refused in exactly the same way."""
+    The fallback rather than the primary because Binance answers 451 to entire
+    countries; that status abandons the host outright rather than stalling the
+    cycle on five more symbols that will be refused in exactly the same way."""
     order = [c for c in CURRENCIES if c[0] == preferred]
     order += [c for c in CURRENCIES if c not in order]
     out = {}
@@ -480,11 +404,6 @@ def _prices_binance(preferred=None):
                 break
     return out
 
-# Tried in order until the currency on screen has a quote. All keyless. The
-# first three each cover every currency in a single request.
-_PRICE_SOURCES = (_prices_coingecko, _prices_mempool,
-                  _prices_blockchain_info, _prices_coinbase)
-
 def _fetch_all_prices(preferred: str | None = None):
     """Refresh the price cache from the first source that answers.
 
@@ -493,16 +412,6 @@ def _fetch_all_prices(preferred: str | None = None):
     success indefinitely after the network dropped.
     """
     pref_gid = CURRENCY_TO_GECKO.get(preferred)
-
-    # The open socket may already carry this rate. Taking it counts as a live
-    # refresh and skips the HTTP chain outright, which is the whole point on a
-    # network where those hosts are unreachable.
-    if pref_gid is not None:
-        with _price_cache_lock:
-            ts = _price_ws_ts.get(pref_gid)
-        if _is_recent(ts, PRICE_WS_FRESH_S):
-            return True
-
     stored = set()
 
     def store(quotes):
@@ -516,10 +425,11 @@ def _fetch_all_prices(preferred: str | None = None):
         # leaves the display blank, so success keys off the wanted quote.
         return (pref_gid in stored) if pref_gid else bool(stored)
 
-    for source in _PRICE_SOURCES:
-        store(source())
-        if got_wanted():
-            return True
+    # CoinGecko covers every currency in one request; Binance is per-symbol
+    # and geo-restricted, so it is only reached for what is actually on screen.
+    store(_prices_coingecko())
+    if got_wanted():
+        return True
     store(_prices_binance(preferred))
     return got_wanted()
 
@@ -628,6 +538,29 @@ def _log_startup_env():
                f"platform={sys.platform}  websocket-client={ws_ver}  "
                f"ca_certs={ca_count}  proxy_env={proxy_vars or 'none'}  "
                f"proxies={proxies or 'none'}")
+    threading.Thread(target=_log_dns_probe, daemon=True).start()
+
+# Hosts worth resolving when diagnosing a connectivity report.
+_DNS_PROBE_HOSTS = ("api.coingecko.com", "api.binance.com", "mempool.space")
+
+def _log_dns_probe():
+    """Log what the price hosts resolve to.
+
+    This separates the two failure modes that otherwise look equally like
+    "no network". A local firewall blocking the process denies the socket
+    outright — WinError 10013 on Windows — and name resolution still returns
+    the real public addresses. DNS interception instead resolves the name to
+    somewhere else, and the plaintext block page waiting there is what a
+    `[SSL: WRONG_VERSION_NUMBER]` on port 443 actually is. Runs on a worker
+    thread: resolution can block for seconds and must not hold up the window.
+    """
+    for host in _DNS_PROBE_HOSTS:
+        try:
+            ips = sorted({ai[4][0] for ai in
+                          socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)})
+            _debug_log(f"dns {host} -> {', '.join(ips)}")
+        except Exception as e:
+            _debug_log(f"dns {host} -> {type(e).__name__}: {e}")
 
 # ── Mempool.space WebSocket: source of truth for Priority tile values ─────────
 # Public, free endpoint. Pushes live `fees` object with fractional sat/vB values
@@ -694,26 +627,6 @@ def _ws_on_message(ws, raw):
                 f"economy={fees.get('economyFee')!r}, minimum={fees.get('minimumFee')!r})  "
                 f"formatted=(HIGH={shown[0]!r}, MED={shown[1]!r}, LOW={shown[2]!r})"
             )
-
-    # Price — {"conversions": {"USD": 93000.0, "EUR": ..., "GBP", "JPY", ...}}.
-    # mempool.space does not quote every currency here (no TRY or RUB), so
-    # whatever it does send is taken and the rest fall through to HTTP.
-    conv = msg.get("conversions")
-    if isinstance(conv, dict):
-        got = {}
-        with _price_cache_lock:
-            for code, _, gid in CURRENCIES:
-                v = conv.get(code)
-                if isinstance(v, (int, float)) and v > 0:
-                    _price_cache[gid] = float(v)
-                    _price_ws_ts[gid] = time.time()
-                    got[code] = float(v)
-        if got:
-            _ws_repaint.set()
-            if _ws_logged.get("conversions") != got:
-                _ws_logged["conversions"] = got
-                _debug_log("ws prices  " + ", ".join(
-                    f"{c}={v:,.0f}" for c, v in got.items()))
 
     # Mempool size — {"mempoolInfo": {"bytes": <vBytes>, "size": <tx_count>, ...}}
     mi = msg.get("mempoolInfo")
