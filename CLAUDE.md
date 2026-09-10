@@ -39,4 +39,6 @@ When adding a new data source, follow the same pattern: fetch on a worker thread
 `autostart_enabled()` / `set_autostart()` register the app for login: a `Run` registry value on Windows, a LaunchAgent plist on macOS, an autostart `.desktop` on Linux. The state is read back from the OS every time the menu opens rather than mirrored into our config, so an entry removed behind the app's back shows as off. `_launch_command()` returns the executable alone when frozen (PyInstaller sets `sys.frozen`) and interpreter-plus-script otherwise.
 
 ### Packaging note
+All three scripts invoke pip and PyInstaller as `python -m pip` / `python -m PyInstaller`, never by console-script name: a pip install puts `pyinstaller.exe` in Python's `Scripts` directory (or `~/.local/bin`), which is not on `PATH` by default, so calling it by name fails with "not recognized" even though the package installed fine. Keep that form when editing them.
+
 `BUILD.bat` / `BUILD.sh` / `BUILD.command` aggressively exclude heavy stdlib/third-party modules (numpy, pandas, matplotlib, smtplib, http.server, etc.) to keep the onefile binary small. If you add an import that transitively pulls one of these in, update the exclude list in all three scripts or the build will ship a much larger binary.

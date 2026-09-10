@@ -28,9 +28,13 @@ taskkill /f /im Tickoshi.exe >nul 2>&1
 echo.
 
 echo  [1/3] Checking dependencies...
-pip show pyinstaller >nul 2>&1 || pip install "pyinstaller>=6.0"
-pip show pillow >nul 2>&1 || pip install "pillow>=10.0"
-pip show websocket-client >nul 2>&1 || pip install "websocket-client>=1.6"
+REM Everything goes through `python -m`. Installing pyinstaller puts
+REM pyinstaller.exe in Python's Scripts directory, which is NOT on PATH on a
+REM default Windows install, so calling it by name fails with "not
+REM recognized" even though the package installed correctly.
+python -m pip show pyinstaller >nul 2>&1 || python -m pip install "pyinstaller>=6.0"
+python -m pip show pillow >nul 2>&1 || python -m pip install "pillow>=10.0"
+python -m pip show websocket-client >nul 2>&1 || python -m pip install "websocket-client>=1.6"
 
 
 echo  [2/3] Cleaning previous build...
@@ -43,7 +47,7 @@ echo.
 set ICON_ARG=
 if exist Tickoshi.ico set ICON_ARG=--icon Tickoshi.ico
 
-pyinstaller ^
+python -m PyInstaller ^
   --onefile ^
   --windowed ^
   --name "Tickoshi" ^

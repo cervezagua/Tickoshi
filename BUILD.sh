@@ -44,9 +44,11 @@ echo ""
 
 # ── Dependencies ──────────────────────────────────────────
 echo " [1/3] Checking dependencies..."
-pip3 show pyinstaller     &>/dev/null || pip3 install "pyinstaller>=6.0"
-pip3 show pillow          &>/dev/null || pip3 install "pillow>=10.0"
-pip3 show websocket-client &>/dev/null || pip3 install "websocket-client>=1.6"
+# Via `python3 -m` throughout: a pip --user install puts the console script
+# in ~/.local/bin, which is not on PATH in every shell.
+python3 -m pip show pyinstaller      &>/dev/null || python3 -m pip install "pyinstaller>=6.0"
+python3 -m pip show pillow           &>/dev/null || python3 -m pip install "pillow>=10.0"
+python3 -m pip show websocket-client &>/dev/null || python3 -m pip install "websocket-client>=1.6"
 
 # ── Clean ─────────────────────────────────────────────────
 echo " [2/3] Cleaning previous build..."
@@ -56,7 +58,7 @@ rm -rf build dist
 echo " [3/3] Building binary..."
 echo ""
 
-pyinstaller \
+python3 -m PyInstaller \
   --onefile \
   --windowed \
   --name "Tickoshi" \
