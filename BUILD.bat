@@ -1,0 +1,89 @@
+@echo off
+title Tickoshi - Build Script
+echo.
+echo  ============================================
+echo  Tickoshi Live Bitcoin Price Widget - Builder
+echo  ============================================
+echo.
+
+python --version >nul 2>&1
+if errorlevel 1 (
+    echo  [ERROR] Python not found. Install Python 3.10+ from python.org
+    pause & exit /b 1
+)
+
+python -c "import sys; sys.exit(0 if sys.version_info>=(3,10) else 1)" >nul 2>&1
+if errorlevel 1 (
+    echo  [ERROR] Python 3.10+ required. Upgrade from python.org
+    pause & exit /b 1
+)
+
+if not exist "Tickoshi.py" (
+    echo  [ERROR] Tickoshi.py not found in current directory.
+    pause & exit /b 1
+)
+
+echo  Closing Tickoshi if running...
+taskkill /f /im Tickoshi.exe >nul 2>&1
+echo.
+
+echo  [1/3] Checking dependencies...
+REM Everything goes through `python -m`. Installing pyinstaller puts
+REM pyinstaller.exe in Python's Scripts directory, which is NOT on PATH on a
+REM default Windows install, so calling it by name fails with "not
+REM recognized" even though the package installed correctly.
+python -m pip show pyinstaller >nul 2>&1 || python -m pip install "pyinstaller>=6.0"
+python -m pip install "pillow>=10.1"
+python -m pip show websocket-client >nul 2>&1 || python -m pip install "websocket-client>=1.6"
+
+
+echo  [2/3] Cleaning previous build...
+if exist build rmdir /s /q build
+if exist dist  rmdir /s /q dist
+
+echo  [3/3] Building EXE...
+echo.
+
+set ICON_ARG=
+if exist assets\Tickoshi.ico set ICON_ARG=--icon assets\Tickoshi.ico
+
+python -m PyInstaller ^
+  --onefile ^
+  --windowed ^
+  --name "Tickoshi" ^
+  --hidden-import PIL._tkinter_finder ^
+  %ICON_ARG% ^
+  --exclude-module numpy ^
+  --exclude-module pandas ^
+  --exclude-module matplotlib ^
+  --exclude-module scipy ^
+  --exclude-module IPython ^
+  --exclude-module notebook ^
+  --exclude-module docutils ^
+  --exclude-module setuptools ^
+  --exclude-module pkg_resources ^
+  --exclude-module xmlrpc ^
+  --exclude-module unittest ^
+  --exclude-module http.server ^
+  --exclude-module ftplib ^
+  --exclude-module imaplib ^
+  --exclude-module poplib ^
+  --exclude-module smtplib ^
+  --exclude-module telnetlib ^
+  --exclude-module certifi ^
+  Tickoshi.py
+
+echo.
+if exist "dist\Tickoshi.exe" (
+    echo  =========================================
+    echo    SUCCESS!  dist\Tickoshi.exe is ready
+    echo  =========================================
+    echo.
+    for %%I in ("dist\Tickoshi.exe") do echo    Size: %%~zI bytes
+    echo.
+    echo  Config saved to: %%APPDATA%%\Tickoshi\
+    echo.
+) else (
+    echo  [ERROR] Build failed. Check output above.
+)
+pause

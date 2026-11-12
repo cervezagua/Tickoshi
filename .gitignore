@@ -1,0 +1,30 @@
+# Build artifacts
+build/
+dist/
+*.spec
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Claude
+.claude/
+
+# Screenshots (local testing), in the top folder only. Anchored with "/" on
+# purpose: unanchored, this also matched assets/Screenshot.png on Windows and
+# macOS, where file names are case-insensitive, and a fresh `git add` would
+# silently leave the README's images out.
+/screenshot*.png
+
+# Runtime (in case a dev run writes to cwd)
+tickoshi_debug.log
+tickoshi_config.json

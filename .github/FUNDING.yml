@@ -1,0 +1,6 @@
+# Shows a "Sponsor" button at the top of the repository on GitHub.
+# GitHub accepts only web links here, so it points at one page: docs/index.html,
+# served by GitHub Pages, which shows each address with a QR code and a copy
+# button. The page only exists once Pages is switched on for this repository
+# (Settings > Pages > Deploy from a branch > main, folder /docs).
+custom: ["https://cervezagua.github.io/Tickoshi/"]

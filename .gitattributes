@@ -1,0 +1,12 @@
+# Shell scripts must use LF line endings regardless of autocrlf setting —
+# bash on macOS/Linux breaks on a CRLF shebang ("env: bash\r: No such file...").
+*.sh         text eol=lf
+*.command    text eol=lf
+
+# Windows batch files use CRLF.
+*.bat        text eol=crlf
+
+# Binary assets — never touch.
+*.ico        binary
+*.icns       binary
+*.png        binary
