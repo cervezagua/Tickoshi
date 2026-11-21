@@ -73,6 +73,10 @@ REFRESH_OPTIONS = [
 # a rate limit, or sockets briefly unavailable while the OS clears a freshly
 # launched binary — leaves the price blank for the whole interval, up to an
 # hour on the 60-minute setting.
+# A fetch cycle slower than this is written to the debug log with the time
+# each request took, so "it feels slow" can be traced to a service.
+SLOW_FETCH_S = 3.0
+
 FETCH_RETRY_MIN_S = 5
 FETCH_RETRY_MAX_S = 60
 
@@ -2464,14 +2468,32 @@ class Tickoshi(tk.Tk):
             # this thread would stop the widget refreshing for the rest of the
             # session — which looks exactly like "the price stopped working".
             display, refreshed = None, False
+            took = {}
             try:
+                t0 = time.monotonic()
                 refreshed = _fetch_all_prices(currency)
-                if needs_height:
-                    _fetch_block_height()
-                if "hash" in modules:
-                    _fetch_hashrate()
-                # Fees + mempool arrive over the WebSocket — no fetch here.
                 display = fetch_price(currency)
+                took["price"] = time.monotonic() - t0
+                # Show the price the moment it is in. Height and hashrate come
+                # from other services; waiting for them here held the price
+                # back by however long the slowest of them took (up to their
+                # 8 s timeouts). This early post only paints: the final post
+                # below is still the one that arms the next cycle.
+                self._result_queue.put(
+                    lambda d=display: self._on_price_ready(d, currency,
+                                                           modules, gen))
+                if needs_height:
+                    t0 = time.monotonic()
+                    _fetch_block_height()
+                    took["height"] = time.monotonic() - t0
+                if "hash" in modules:
+                    t0 = time.monotonic()
+                    _fetch_hashrate()
+                    took["hashrate"] = time.monotonic() - t0
+                # Fees + mempool arrive over the WebSocket — no fetch here.
+                if sum(took.values()) > SLOW_FETCH_S:
+                    _debug_log("slow fetch cycle: " + ", ".join(
+                        f"{k} {v:.1f}s" for k, v in took.items()))
                 if not refreshed:
                     _debug_log(f"fetch cycle: no live {currency} price from any "
                                f"source (showing "
@@ -2484,6 +2506,14 @@ class Tickoshi(tk.Tk):
                                                 gen, refreshed))
 
         threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_price_ready(self, display, currency, modules, gen):
+        """Paint a freshly fetched price before the rest of the cycle ends."""
+        if (gen == self._fetch_gen and display is not None
+                and currency == self._currency
+                and modules == frozenset(self._modules)):
+            self._last_price_str = display
+            self._update_display(display)
 
     def _on_fetch_done(self, display, currency, modules, gen, refreshed=True):
         # Stale worker (a newer _fetch_loop has superseded this one) — drop it
@@ -2656,9 +2686,18 @@ class Tickoshi(tk.Tk):
     def _copy_to_clipboard(self, e):
         # Every child gets this binding, the ticker included; there a
         # double-click means "open this headline", not "copy the price".
+        #
+        # Every child also inherits the toplevel's own <Double-Button-1>
+        # binding through its bindtags, so without "break" this ran twice
+        # per double-click — and opened every headline in two browser tabs.
+        # The widget's binding runs first; "break" stops the toplevel one.
         if isinstance(e.widget, NewsTicker):
             e.widget.open_at(e.x)
-            return
+            return "break"
+        self._copy_price()
+        return "break"
+
+    def _copy_price(self):
         if self._last_display_str:
             self.clipboard_clear()
             self.clipboard_append(self._last_display_str)
