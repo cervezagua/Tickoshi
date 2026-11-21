@@ -2656,9 +2656,18 @@ class Tickoshi(tk.Tk):
     def _copy_to_clipboard(self, e):
         # Every child gets this binding, the ticker included; there a
         # double-click means "open this headline", not "copy the price".
+        #
+        # Every child also inherits the toplevel's own <Double-Button-1>
+        # binding through its bindtags, so without "break" this ran twice
+        # per double-click — and opened every headline in two browser tabs.
+        # The widget's binding runs first; "break" stops the toplevel one.
         if isinstance(e.widget, NewsTicker):
             e.widget.open_at(e.x)
-            return
+            return "break"
+        self._copy_price()
+        return "break"
+
+    def _copy_price(self):
         if self._last_display_str:
             self.clipboard_clear()
             self.clipboard_append(self._last_display_str)
