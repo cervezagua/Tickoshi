@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-orange?style=flat-square" />
+  <img src="https://img.shields.io/badge/version-1.1-orange?style=flat-square" />
 </p>
 
 <p align="center">
@@ -51,6 +51,24 @@
 - **Lock** — freeze position so you don't drag it by accident
 - **Double-click to copy** — copies current value to clipboard
 - **Persistent config** — all settings are remembered between sessions
+
+---
+
+## Download
+
+Ready-made builds are on the [latest release](https://github.com/cervezagua/Tickoshi/releases/latest):
+
+| Platform | File | Notes |
+|---|---|---|
+| Windows | `Tickoshi.exe` | Portable, nothing to install. Double-click to run. |
+| macOS | `Tickoshi-macos.zip` | Unzip, then move `Tickoshi.app` to Applications. |
+| Linux | — | Build it from source (below). |
+
+> **macOS, first launch:** the app isn't notarized by Apple, so macOS blocks a downloaded copy the first time. Right-click `Tickoshi.app` → **Open**, then confirm. Or, in Terminal, from the folder the app is in:
+> ```bash
+> xattr -d com.apple.quarantine Tickoshi.app
+> ```
+> The app is built for the type of chip in the Mac that built it (Apple Silicon or Intel). If it won't start on yours, build it yourself with `BUILD.command` (below); that takes a few minutes and needs no Apple account.
 
 ---
 
@@ -103,12 +121,9 @@ chmod +x BUILD.command
 ./BUILD.command
 ```
 
-Produces `dist/Tickoshi.app` (ad-hoc signed) and `dist/Tickoshi-macos.zip` (ready for release upload).
+Produces `dist/Tickoshi.app` (ad-hoc signed) and `dist/Tickoshi-macos.zip`, the file to attach to a release.
 
-> **First launch (Gatekeeper):** macOS will refuse to open the app because it isn't notarized. Right-click the app → **Open** (then confirm), or run:
-> ```bash
-> xattr -d com.apple.quarantine dist/Tickoshi.app
-> ```
+An app you build yourself opens directly: macOS only quarantines files downloaded from the internet, so the Gatekeeper step above applies to the release zip, not to your own build.
 
 > **macOS + HTTPS:** Python's OpenSSL on macOS can't read the system Keychain, so the app falls back to [`certifi`](https://pypi.org/project/certifi/)'s CA bundle (installed and bundled by `BUILD.command` automatically). Builds made before this fix show no data at all — every HTTPS/WSS request failed certificate verification. Rebuild with the current `BUILD.command` to fix.
 
