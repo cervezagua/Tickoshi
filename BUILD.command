@@ -231,9 +231,11 @@ if [ -d "dist/Tickoshi.app" ]; then
     echo ""
     echo "   Config saved to: ~/Library/Application Support/Tickoshi/"
     echo ""
-    echo "   First launch (Gatekeeper):"
-    echo "     Right-click the app → Open, or run:"
-    echo "       xattr -d com.apple.quarantine dist/Tickoshi.app"
+    # A copy built here is never quarantined, so it opens directly. Only a
+    # copy downloaded (e.g. the release zip) trips Gatekeeper.
+    echo "   This build opens directly. A downloaded copy (the zip) will be"
+    echo "   blocked by Gatekeeper on first launch: right-click → Open, or"
+    echo "       xattr -d com.apple.quarantine Tickoshi.app"
     echo ""
 else
     echo " [ERROR] Build failed. Check output above."
