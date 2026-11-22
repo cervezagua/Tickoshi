@@ -32,6 +32,7 @@ pick_python() {
     for c in ${PYTHON:+"$PYTHON"} \
              python3.14 python3.13 python3.12 python3.11 python3.10 \
              /Library/Frameworks/Python.framework/Versions/3.1[0-9]/bin/python3 \
+             /opt/homebrew/bin/python3.1[0-9] /usr/local/bin/python3.1[0-9] \
              /opt/homebrew/bin/python3 /usr/local/bin/python3 python3; do
         p=$(command -v "$c" 2>/dev/null) || continue
         "$p" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' \
@@ -45,24 +46,88 @@ pick_python() {
     return 1
 }
 
-if ! pick_python; then
-    if [ -n "$NO_TK" ]; then
-        echo " [ERROR] Found Python 3.10+ at $NO_TK, but it has no tkinter."
-        echo "         Homebrew Python needs its Tk package, matching the version:"
-        echo "           brew install python-tk@$("$NO_TK" -c 'import sys; print(f"{sys.version_info[0]}.{sys.version_info[1]}")')"
-        echo "         Or install Python from python.org, which includes Tk."
-    else
-        CUR=$(command -v python3 2>/dev/null || true)
-        echo " [ERROR] Python 3.10+ required."
-        if [ -n "$CUR" ]; then
-            echo "         The python3 found was $CUR ($("$CUR" --version 2>&1))."
+# ── Install Python if there is no suitable one ────────────
+# Offered, never done silently: it changes the Mac, and the python.org route
+# needs the user's password. Homebrew, when present, is used first (no
+# password); otherwise the official python.org installer is downloaded, its
+# signature checked, and installed.
+BREW=""
+for b in brew /opt/homebrew/bin/brew /usr/local/bin/brew; do
+    BREW=$(command -v "$b" 2>/dev/null) && break
+done
+
+ask() {  # ask "question" -> 0 for yes (the default), 1 for no or no terminal
+    local a
+    [ -t 0 ] || return 1
+    read -r -p "$1 [Y/n] " a || return 1
+    case "$a" in [nN]*) return 1;; esac
+    return 0
+}
+
+install_from_python_org() {
+    # Newest 3.13 / 3.12 release that has a macOS installer. Later releases
+    # of an older series are source-only security fixes with no installer,
+    # so each candidate is checked before it is chosen.
+    local index versions v pkg url tmp
+    index=$(curl -fsSL https://www.python.org/ftp/python/) || {
+        echo " [ERROR] Could not reach python.org."; return 1; }
+    versions=$(printf '%s\n' "$index" | grep -oE 'href="3\.1[23]\.[0-9]+/"' |
+               grep -oE '3\.1[23]\.[0-9]+' | sort -t. -k2,2nr -k3,3nr | uniq)
+    for v in $versions; do
+        pkg="python-$v-macos11.pkg"
+        url="https://www.python.org/ftp/python/$v/$pkg"
+        if curl -fsIL "$url" >/dev/null 2>&1; then
+            tmp=$(mktemp -d)
+            echo " Downloading Python $v from python.org..."
+            curl -fL --progress-bar -o "$tmp/$pkg" "$url" || {
+                rm -rf "$tmp"; echo " [ERROR] Download failed."; return 1; }
+            if ! pkgutil --check-signature "$tmp/$pkg" 2>/dev/null |
+                    grep -q "Python Software Foundation"; then
+                rm -rf "$tmp"
+                echo " [ERROR] The downloaded installer is not signed by the"
+                echo "         Python Software Foundation. Not installing it."
+                return 1
+            fi
+            echo " Installing Python $v (macOS will ask for your password)..."
+            sudo installer -pkg "$tmp/$pkg" -target / || { rm -rf "$tmp"; return 1; }
+            rm -rf "$tmp"
+            return 0
         fi
-        echo "         macOS's built-in python3 is too old. Install a current Python:"
-        echo "           https://www.python.org/downloads/macos/   (includes Tk)"
-        echo "         or with Homebrew:"
-        echo "           brew install python@3.12 python-tk@3.12"
-        echo "         then run this script again."
+    done
+    echo " [ERROR] No macOS installer found on python.org for 3.12 or 3.13."
+    return 1
+}
+
+offer_install() {
+    echo ""
+    echo " Tickoshi needs Python 3.10 or newer with Tk to build, and none was found."
+    if [ -n "$NO_TK" ] && [ -n "$BREW" ]; then
+        local mm
+        mm=$("$NO_TK" -c 'import sys; print(f"{sys.version_info[0]}.{sys.version_info[1]}")')
+        echo " $NO_TK is Python $mm but has no Tk."
+        ask " Install Tk for it with Homebrew now (brew install python-tk@$mm)?" &&
+            "$BREW" install "python-tk@$mm"
+    elif [ -n "$BREW" ]; then
+        ask " Install Python 3.12 with Homebrew now (brew install python@3.12 python-tk@3.12)?" &&
+            "$BREW" install python@3.12 python-tk@3.12
+    else
+        ask " Download and install Python from python.org now? (asks for your Mac password)" &&
+            install_from_python_org
     fi
+}
+
+if ! pick_python && ! { offer_install && pick_python; }; then
+    echo ""
+    CUR=$(command -v python3 2>/dev/null || true)
+    echo " [ERROR] Python 3.10+ with Tk is required."
+    if [ -n "$NO_TK" ]; then
+        echo "         $NO_TK is new enough but has no Tk."
+    elif [ -n "$CUR" ]; then
+        echo "         The python3 found was $CUR ($("$CUR" --version 2>&1))."
+    fi
+    echo "         Install one of these, then run this script again:"
+    echo "           https://www.python.org/downloads/macos/   (includes Tk)"
+    echo "           brew install python@3.12 python-tk@3.12"
     exit 1
 fi
 echo " Using $PY ($("$PY" --version 2>&1))"
