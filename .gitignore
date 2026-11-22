@@ -1,6 +1,7 @@
 # Build artifacts
 build/
 dist/
+.build-venv/
 *.spec
 
 # Python

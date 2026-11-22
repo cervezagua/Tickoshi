@@ -94,6 +94,8 @@ Produces `dist/Tickoshi` — a single ELF binary. A `.desktop` launcher is also 
 
 ### macOS
 
+Needs Python 3.10 or newer with Tk. The `python3` that comes with macOS is 3.9, which is too old: install Python from [python.org](https://www.python.org/downloads/macos/) (includes Tk), or with Homebrew run `brew install python@3.12 python-tk@3.12`. The script finds it by itself and builds in its own `.build-venv` folder.
+
 Double-click **`BUILD.command`** in Finder, or run from a terminal:
 
 ```bash

@@ -21,25 +21,51 @@ echo " ==========================================="
 echo ""
 
 # ── Python check ──────────────────────────────────────────
-if ! python3 --version &>/dev/null; then
-    echo " [ERROR] python3 not found."
-    echo "         Install from python.org or: brew install python"
-    exit 1
-fi
+# Macs usually have several Pythons, and the first `python3` on PATH is
+# often Apple's own /usr/bin/python3 (3.9 on current macOS), which is too
+# old. So look for one that is 3.10+ and has tkinter, newest first, in the
+# places python.org and Homebrew install to. Set PYTHON=/path/to/python3 to
+# choose one yourself.
+PY=""
+NO_TK=""
+pick_python() {
+    for c in ${PYTHON:+"$PYTHON"} \
+             python3.14 python3.13 python3.12 python3.11 python3.10 \
+             /Library/Frameworks/Python.framework/Versions/3.1[0-9]/bin/python3 \
+             /opt/homebrew/bin/python3 /usr/local/bin/python3 python3; do
+        p=$(command -v "$c" 2>/dev/null) || continue
+        "$p" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' \
+            2>/dev/null || continue
+        if "$p" -c 'import tkinter' 2>/dev/null; then
+            PY="$p"
+            return 0
+        fi
+        [ -n "$NO_TK" ] || NO_TK="$p"
+    done
+    return 1
+}
 
-if ! python3 -c "import sys; sys.exit(0 if sys.version_info>=(3,10) else 1)"; then
-    echo " [ERROR] Python 3.10+ required."
+if ! pick_python; then
+    if [ -n "$NO_TK" ]; then
+        echo " [ERROR] Found Python 3.10+ at $NO_TK, but it has no tkinter."
+        echo "         Homebrew Python needs its Tk package, matching the version:"
+        echo "           brew install python-tk@$("$NO_TK" -c 'import sys; print(f"{sys.version_info[0]}.{sys.version_info[1]}")')"
+        echo "         Or install Python from python.org, which includes Tk."
+    else
+        CUR=$(command -v python3 2>/dev/null || true)
+        echo " [ERROR] Python 3.10+ required."
+        if [ -n "$CUR" ]; then
+            echo "         The python3 found was $CUR ($("$CUR" --version 2>&1))."
+        fi
+        echo "         macOS's built-in python3 is too old. Install a current Python:"
+        echo "           https://www.python.org/downloads/macos/   (includes Tk)"
+        echo "         or with Homebrew:"
+        echo "           brew install python@3.12 python-tk@3.12"
+        echo "         then run this script again."
+    fi
     exit 1
 fi
-
-# Tkinter ships with the python.org installer and Homebrew python, but
-# system Python on older macOS sometimes lacks it — warn early.
-if ! python3 -c "import tkinter" &>/dev/null; then
-    echo " [ERROR] tkinter not available in this Python."
-    echo "         Install Python from python.org (bundles Tk) or:"
-    echo "           brew install python-tk"
-    exit 1
-fi
+echo " Using $PY ($("$PY" --version 2>&1))"
 
 if [ ! -f "Tickoshi.py" ]; then
     echo " [ERROR] Tickoshi.py not found in current directory."
@@ -53,16 +79,22 @@ echo ""
 
 # ── Dependencies ──────────────────────────────────────────
 echo " [1/4] Checking dependencies..."
-# Everything goes through `python3 -m` — on Macs with several Pythons
-# (Homebrew, python.org, Xcode CLT), bare `pip3` can belong to a different
-# interpreter than `python3`, and --user console scripts land in
-# ~/Library/Python/3.x/bin which is not on PATH.
-python3 -m pip show pyinstaller      &>/dev/null || python3 -m pip install --user "pyinstaller>=6.0"
-python3 -m pip install --user "pillow>=10.1"
-python3 -m pip show websocket-client &>/dev/null || python3 -m pip install --user "websocket-client>=1.6"
+# Build in a private virtual environment. Homebrew's Python refuses
+# `pip install` outside one ("externally-managed-environment"), and a venv
+# also keeps PyInstaller and friends out of the user's own Python. It is
+# rebuilt whenever the Python chosen above changes.
+VENV=".build-venv"
+if [ ! -x "$VENV/bin/python" ] || [ "$(cat "$VENV/.base" 2>/dev/null)" != "$PY" ]; then
+    rm -rf "$VENV"
+    "$PY" -m venv "$VENV"
+    echo "$PY" > "$VENV/.base"
+fi
+VPY="$VENV/bin/python"
+"$VPY" -m pip install --quiet --upgrade pip
 # certifi supplies the CA bundle the app falls back to on macOS, where
 # Python's OpenSSL can't read the system Keychain (see Tickoshi.py header).
-python3 -m pip show certifi          &>/dev/null || python3 -m pip install --user "certifi"
+"$VPY" -m pip install --quiet "pyinstaller>=6.0" "pillow>=10.1" \
+    "websocket-client>=1.6" certifi
 
 # ── Clean ─────────────────────────────────────────────────
 echo " [2/4] Cleaning previous build..."
@@ -77,7 +109,7 @@ if [ -f "assets/Tickoshi.icns" ]; then
     ICON_ARG=(--icon "assets/Tickoshi.icns")
 fi
 
-python3 -m PyInstaller \
+"$VPY" -m PyInstaller \
   --onefile \
   --windowed \
   --name "Tickoshi" \
