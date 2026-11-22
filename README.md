@@ -60,8 +60,8 @@ Ready-made builds are on the [latest release](https://github.com/cervezagua/Tick
 
 | Platform | File | Notes |
 |---|---|---|
-| Windows | `Tickoshi.exe` | Portable, nothing to install. Double-click to run. |
-| macOS | `Tickoshi-macos.zip` | Unzip, then move `Tickoshi.app` to Applications. |
+| Windows | `Tickoshi-v<version>.exe` | Portable, nothing to install. Double-click to run. |
+| macOS | `Tickoshi-macos-v<version>.zip` | Unzip, then move `Tickoshi.app` to Applications. |
 | Linux | — | Build it from source (below). |
 
 > **macOS, first launch:** the app isn't notarized by Apple, so macOS blocks a downloaded copy the first time. Right-click `Tickoshi.app` → **Open**, then confirm. Or, in Terminal, from the folder the app is in:
