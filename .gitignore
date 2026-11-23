@@ -2,6 +2,7 @@
 build/
 dist/
 .build-venv/
+.venv/
 *.spec
 
 # Python

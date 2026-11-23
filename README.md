@@ -74,17 +74,32 @@ Ready-made builds are on the [latest release](https://github.com/cervezagua/Tick
 
 ## Running from source
 
-Requires Python 3.10+ and two pip packages:
+Requires Python 3.10+ with Tk, and two pip packages. Install them in a virtual environment: Kali, recent Debian and Ubuntu, and Homebrew's Python refuse `pip install` into the system Python ("externally-managed-environment").
+
+macOS / Linux:
 
 ```bash
-pip install websocket-client "pillow>=10.1"
-python Tickoshi.py
+python3 -m venv .venv
+.venv/bin/pip install websocket-client "pillow>=10.1"
+.venv/bin/python Tickoshi.py
 ```
 
-> **Linux:** make sure `python3-tk` is installed.
+Windows:
+
+```bat
+py -m venv .venv
+.venv\Scripts\pip install websocket-client "pillow>=10.1"
+.venv\Scripts\python Tickoshi.py
+```
+
+> **Linux:** Tk and venv are separate packages on most distros.
 > ```bash
-> # Ubuntu / Debian
-> sudo apt install python3-tk
+> # Debian / Ubuntu / Kali
+> sudo apt install python3-tk python3-venv
+> # Fedora
+> sudo dnf install python3-tkinter
+> # Arch
+> sudo pacman -S tk
 > ```
 
 ---
