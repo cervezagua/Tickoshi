@@ -108,6 +108,8 @@ chmod +x BUILD.sh
 ./BUILD.sh
 ```
 
+Needs Python 3.10+ with Tk and venv. If anything is missing (Debian, Ubuntu and Kali ship Tk and venv as separate packages), the script lists it and offers to install it with your package manager, which asks for your password. It builds in its own `.build-venv` folder, so it works on distros that block `pip install` into the system Python.
+
 Produces `dist/Tickoshi` — a single ELF binary. A `.desktop` launcher is also created automatically at `~/.local/share/applications/tickoshi.desktop`.
 
 ### macOS
