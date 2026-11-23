@@ -155,7 +155,8 @@ if [ ! -x "$VENV/bin/python" ] || [ "$(cat "$VENV/.base" 2>/dev/null)" != "$PY" 
     echo "$PY" > "$VENV/.base"
 fi
 VPY="$VENV/bin/python"
-"$VPY" -m pip install --quiet --upgrade pip
+# No `pip install --upgrade pip` here: Debian-family pip (Ubuntu, Kali)
+# can crash replacing itself mid-run, and the bundled pip is new enough.
 # certifi supplies the CA bundle the app falls back to on macOS, where
 # Python's OpenSSL can't read the system Keychain (see Tickoshi.py header).
 "$VPY" -m pip install --quiet "pyinstaller>=6.0" "pillow>=10.1" \
